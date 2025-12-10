@@ -54,7 +54,25 @@ class OpenGLWidget(QOpenGLWidget):
         # Grid label positions for rendering (updated during draw_build_plate)
         self.grid_labels = []  # List of (screen_x, screen_y, text) tuples
         self.triad_labels = []  # List of (screen_x, screen_y, text, color) tuples
-        
+
+        # Slice mode state
+        self.view_mode = 'layout'  # 'layout' or 'slice'
+        self.layer_thickness = 0.2  # mm
+        self.current_layer_index = 0  # Current layer being viewed
+        self.sliced_layers = []  # List of sliced layer outlines for each model
+
+        # Slice mode scrollbar gizmo state
+        self.scrollbar_dragging = False
+        self.scrollbar_hover = False
+        self.scrollbar_width = 20  # pixels
+        self.scrollbar_margin = 10  # pixels from right edge
+
+        # Hatching state
+        self.hatching_enabled = False  # Whether to show hatching in slice mode
+        self.hatching_data = {}  # Dict mapping layer_index -> List[HatchLine]
+        self.hatching_params = None  # HatchingParameters instance
+        self.hatching_strategy = None  # HatchingStrategy enum value
+
     def initializeGL(self):
         """Initialize OpenGL context and settings"""
         # Set up OpenGL context
@@ -66,22 +84,38 @@ class OpenGLWidget(QOpenGLWidget):
         # Disable face culling to see both sides of faces
         glDisable(GL_CULL_FACE)
         
-        # Set clear color to 10% gray background
-        glClearColor(0.1, 0.1, 0.1, 1.0)
-        
-        # Set up lighting (basic)
+        # Set clear color to light gray background (70% gray)
+        glClearColor(0.7, 0.7, 0.7, 1.0)
+
+        # Set up lighting with multiple lights for even illumination
         glEnable(GL_LIGHTING)
+
+        # Enable ambient light for base illumination
+        glLightModelfv(GL_LIGHT_MODEL_AMBIENT, [0.4, 0.4, 0.4, 1.0])
+
+        # Main key light (top-front-right)
         glEnable(GL_LIGHT0)
-        
-        # Set light properties
-        light_position = [1.0, 1.0, 1.0, 0.0]
-        glLightfv(GL_LIGHT0, GL_POSITION, light_position)
-        
+        glLightfv(GL_LIGHT0, GL_POSITION, [1.0, 1.0, 1.0, 0.0])
+        glLightfv(GL_LIGHT0, GL_DIFFUSE, [0.6, 0.6, 0.6, 1.0])
+        glLightfv(GL_LIGHT0, GL_SPECULAR, [0.3, 0.3, 0.3, 1.0])
+
+        # Fill light (top-front-left) for better illumination
+        glEnable(GL_LIGHT1)
+        glLightfv(GL_LIGHT1, GL_POSITION, [-1.0, 1.0, 1.0, 0.0])
+        glLightfv(GL_LIGHT1, GL_DIFFUSE, [0.4, 0.4, 0.4, 1.0])
+        glLightfv(GL_LIGHT1, GL_SPECULAR, [0.1, 0.1, 0.1, 1.0])
+
+        # Back light (from below-back) to prevent dark silhouettes
+        glEnable(GL_LIGHT2)
+        glLightfv(GL_LIGHT2, GL_POSITION, [0.0, -0.5, -1.0, 0.0])
+        glLightfv(GL_LIGHT2, GL_DIFFUSE, [0.3, 0.3, 0.3, 1.0])
+        glLightfv(GL_LIGHT2, GL_SPECULAR, [0.0, 0.0, 0.0, 1.0])
+
         # Set material properties
         glMaterialfv(GL_FRONT, GL_DIFFUSE, [0.8, 0.8, 0.8, 1.0])
         glMaterialfv(GL_FRONT, GL_SPECULAR, [1.0, 1.0, 1.0, 1.0])
         glMaterialf(GL_FRONT, GL_SHININESS, 50.0)
-        
+
         # Enable flat shading (slicer-style)
         glShadeModel(GL_FLAT)
         
@@ -136,34 +170,63 @@ class OpenGLWidget(QOpenGLWidget):
         glMatrixMode(GL_MODELVIEW)
         glLoadIdentity()
 
-        # Move camera back based on zoom level
-        glTranslatef(0.0, 0.0, -self.camera_distance)
+        # Draw based on view mode
+        if self.view_mode == 'slice':
+            # Slice mode: 2D orthographic view from the build direction (looking at XZ plane)
+            # Set up orthographic projection for 2D view
+            glMatrixMode(GL_PROJECTION)
+            glLoadIdentity()
 
-        # Apply pan (in camera space, before rotation)
-        glTranslatef(self.pan_x, self.pan_y, 0.0)
+            # Calculate the view bounds (show build plate area)
+            view_size = 60.0  # Show 120mm x 120mm area (build plate is 100mm diameter)
+            glOrtho(-view_size, view_size, -view_size, view_size, -100, 100)
 
-        # Apply rotations around the build plate center
-        glRotatef(self.rotation_x, 1.0, 0.0, 0.0)
-        glRotatef(self.rotation_y, 0.0, 1.0, 0.0)
-        glRotatef(self.rotation_z, 0.0, 0.0, 1.0)
+            glMatrixMode(GL_MODELVIEW)
+            glLoadIdentity()
 
-        # Always draw the build plate first
-        self.draw_build_plate()
+            # View from the build direction (as if we're the electron gun)
+            # We want to look at the XZ plane (horizontal plane)
+            # Rotate 90 degrees around X axis to look from below upward
+            glRotatef(-90, 1.0, 0.0, 0.0)
 
-        # Draw all loaded CAD models
-        for i, model_data in enumerate(self.models):
-            is_selected = (i == self.selected_model_index)
-            self.draw_cad_model(model_data, is_selected)
+            # Draw sliced layer outlines
+            self.draw_sliced_layers()
 
-        # Draw transformation gizmo for selected model
-        if self.selected_model_index is not None and self.transform_mode:
-            self.draw_gizmo(self.models[self.selected_model_index])
+            # Draw scrollbar gizmo
+            self.draw_scrollbar_gizmo()
+        else:
+            # Layout mode: 3D perspective view
+            # Move camera back based on zoom level
+            glTranslatef(0.0, 0.0, -self.camera_distance)
 
-        # Draw orientation triad in bottom-left corner
-        self.draw_orientation_triad()
+            # Apply pan (in camera space, before rotation)
+            glTranslatef(self.pan_x, self.pan_y, 0.0)
 
-        # Draw grid labels using QPainter overlay
-        self.draw_grid_labels()
+            # Apply rotations around the build plate center
+            glRotatef(self.rotation_x, 1.0, 0.0, 0.0)
+            glRotatef(self.rotation_y, 0.0, 1.0, 0.0)
+            glRotatef(self.rotation_z, 0.0, 0.0, 1.0)
+
+            # Draw the build plate
+            self.draw_build_plate()
+
+            # Draw all loaded CAD models
+            for i, model_data in enumerate(self.models):
+                is_selected = (i == self.selected_model_index)
+                self.draw_cad_model(model_data, is_selected)
+
+            # Draw transformation gizmo for selected model
+            if self.selected_model_index is not None and self.transform_mode:
+                self.draw_gizmo(self.models[self.selected_model_index])
+
+            # Draw orientation triad in bottom-left corner
+            self.draw_orientation_triad()
+
+            # Draw grid labels using QPainter overlay
+            self.draw_grid_labels()
+
+        # Draw slice mode info overlay (in both modes, but only has content in slice mode)
+        self.draw_slice_info_overlay()
         
     def draw_cube(self):
         """Draw a simple colored cube"""
@@ -601,6 +664,31 @@ class OpenGLWidget(QOpenGLWidget):
 
         painter.end()
 
+    def draw_slice_info_overlay(self):
+        """Draw slice information text overlay in slice mode"""
+        if self.view_mode != 'slice' or not hasattr(self, 'slice_info_text'):
+            return
+
+        # Create painter for 2D overlay
+        painter = QPainter(self)
+        painter.beginNativePainting()
+        painter.endNativePainting()
+
+        # Set up font - larger, bold for visibility
+        font = QFont("Arial", 12, QFont.Weight.Bold)
+        font.setStyleHint(QFont.StyleHint.SansSerif)
+        painter.setFont(font)
+
+        # Set text color - solid white for good contrast
+        text_color = QColor(255, 255, 255, 255)
+        painter.setPen(text_color)
+
+        # Draw text at the stored position
+        x, y = self.slice_info_position
+        painter.drawText(int(x), int(y), self.slice_info_text)
+
+        painter.end()
+
     def draw_cad_model(self, model_data, is_selected=False):
         """Draw the actual CAD model using mesh data"""
         cad_model = model_data.get('model')
@@ -656,16 +744,16 @@ class OpenGLWidget(QOpenGLWidget):
 
         # Set material properties based on selection state
         if is_selected:
-            # Blue color for selected model
-            glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT, [0.2, 0.3, 0.5, 1.0])
-            glMaterialfv(GL_FRONT_AND_BACK, GL_DIFFUSE, [0.3, 0.5, 0.9, 1.0])
-            glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, [0.4, 0.5, 0.7, 1.0])
+            # Blue color for selected model (darker for better contrast)
+            glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT, [0.15, 0.2, 0.35, 1.0])
+            glMaterialfv(GL_FRONT_AND_BACK, GL_DIFFUSE, [0.2, 0.4, 0.8, 1.0])
+            glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, [0.3, 0.4, 0.6, 1.0])
             glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, 30.0)
         else:
-            # Default gray color for unselected models
-            glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT, [0.3, 0.3, 0.3, 1.0])
-            glMaterialfv(GL_FRONT_AND_BACK, GL_DIFFUSE, [0.6, 0.6, 0.65, 1.0])
-            glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, [0.3, 0.3, 0.3, 1.0])
+            # Default gray color for unselected models (darker for visibility)
+            glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT, [0.2, 0.2, 0.2, 1.0])
+            glMaterialfv(GL_FRONT_AND_BACK, GL_DIFFUSE, [0.45, 0.45, 0.48, 1.0])
+            glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, [0.25, 0.25, 0.25, 1.0])
             glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, 20.0)
 
         # Draw using vertex arrays for better performance
@@ -725,43 +813,59 @@ class OpenGLWidget(QOpenGLWidget):
         glPopMatrix()
         
     def load_cad_model(self, file_path):
-        """Load and prepare CAD model for rendering"""
+        """Load and prepare CAD model for rendering (synchronous)"""
         print(f"Loading CAD model from: {file_path}")
 
         # Load the CAD file and extract mesh data
         model = load_cad_file(file_path)
 
         if model:
-            # Extract filename for display
-            import os
-            filename = os.path.basename(file_path)
-
-            # Create model data dictionary
-            model_data = {
-                'model': model,
-                'name': filename,
-                'path': file_path,
-                'center': model.get_center(),
-                'bounds': model.bounds,
-                # Transformation properties
-                'position': [0.0, 0.0, 0.0],  # Translation offset from auto-centered position
-                'rotation': [0.0, 0.0, 0.0],  # Rotation in degrees around X, Y, Z
-                'scale': [1.0, 1.0, 1.0]  # Scale factors for X, Y, Z
-            }
-
-            # Add to models list
-            self.models.append(model_data)
-
-            print(f"Model loaded successfully: {filename}")
-            print(f"Model bounds: {model.bounds}")
-
-            self.update()  # Trigger repaint
-
-            # Return the index of the newly added model
-            return len(self.models) - 1
+            return self.add_loaded_model(model, file_path)
         else:
             print("Failed to load CAD model")
             return None
+
+    def add_loaded_model(self, model, file_path):
+        """
+        Add an already-loaded CAD model to the scene.
+
+        Args:
+            model: CADModel instance
+            file_path: Path to the original CAD file
+
+        Returns:
+            Index of the newly added model, or None if model is invalid
+        """
+        if not model:
+            return None
+
+        # Extract filename for display
+        import os
+        filename = os.path.basename(file_path)
+
+        # Create model data dictionary
+        model_data = {
+            'model': model,
+            'name': filename,
+            'path': file_path,
+            'center': model.get_center(),
+            'bounds': model.bounds,
+            # Transformation properties
+            'position': [0.0, 0.0, 0.0],  # Translation offset from auto-centered position
+            'rotation': [0.0, 0.0, 0.0],  # Rotation in degrees around X, Y, Z
+            'scale': [1.0, 1.0, 1.0]  # Scale factors for X, Y, Z
+        }
+
+        # Add to models list
+        self.models.append(model_data)
+
+        print(f"Model added successfully: {filename}")
+        print(f"Model bounds: {model.bounds}")
+
+        self.update()  # Trigger repaint
+
+        # Return the index of the newly added model
+        return len(self.models) - 1
 
     def set_selected_model(self, index):
         """Set the selected model by index"""
@@ -986,6 +1090,13 @@ class OpenGLWidget(QOpenGLWidget):
         """Handle mouse press events"""
         from PyQt6.QtCore import Qt
         if event.button() == Qt.MouseButton.LeftButton:
+            # In slice mode, check for scrollbar interaction
+            if self.view_mode == 'slice':
+                if self.is_point_in_scrollbar(event.pos().x(), event.pos().y()):
+                    self.scrollbar_dragging = True
+                    self.handle_scrollbar_click(event.pos().y())
+                    return
+
             # Check if in face picking mode
             if self.face_picking_mode:
                 face_normal = self.pick_face_at(event.pos().x(), event.pos().y())
@@ -1014,22 +1125,36 @@ class OpenGLWidget(QOpenGLWidget):
                     elif self.transform_mode == 'scale':
                         self.transform_start_value = model_data['scale'].copy()
             else:
-                # Normal camera controls
-                modifiers = event.modifiers()
+                # Normal camera controls (only in layout mode)
+                if self.view_mode == 'layout':
+                    modifiers = event.modifiers()
 
-                # Check which modifier key is held
-                if modifiers & Qt.KeyboardModifier.AltModifier:
-                    self.is_panning = True
-                elif modifiers & Qt.KeyboardModifier.ControlModifier:
-                    self.is_zooming = True
-                else:
-                    self.is_rotating = True
+                    # Check which modifier key is held
+                    if modifiers & Qt.KeyboardModifier.AltModifier:
+                        self.is_panning = True
+                    elif modifiers & Qt.KeyboardModifier.ControlModifier:
+                        self.is_zooming = True
+                    else:
+                        self.is_rotating = True
 
             self.last_mouse_pos = event.pos()
 
     def mouseMoveEvent(self, event):
         """Handle mouse move events for rotation, panning, zooming, and gizmo interaction"""
         from PyQt6.QtCore import Qt
+
+        # In slice mode, handle scrollbar interaction
+        if self.view_mode == 'slice':
+            # Check for scrollbar hover
+            was_hover = self.scrollbar_hover
+            self.scrollbar_hover = self.is_point_in_scrollbar(event.pos().x(), event.pos().y())
+            if was_hover != self.scrollbar_hover:
+                self.update()
+
+            # Handle scrollbar dragging
+            if self.scrollbar_dragging:
+                self.handle_scrollbar_drag(event.pos().y())
+                return
 
         # Check for gizmo hover (only when in transform mode and not currently dragging)
         if self.transform_mode and self.selected_model_index is not None and not self.is_dragging_gizmo:
@@ -1091,6 +1216,7 @@ class OpenGLWidget(QOpenGLWidget):
             self.is_zooming = False
             self.is_dragging_gizmo = False
             self.selected_gizmo_axis = None
+            self.scrollbar_dragging = False
             self.last_mouse_pos = None
 
             if was_dragging:
@@ -1183,7 +1309,7 @@ class OpenGLWidget(QOpenGLWidget):
         glPopAttrib()
 
         # Restore background color
-        glClearColor(0.1, 0.1, 0.1, 1.0)
+        glClearColor(0.7, 0.7, 0.7, 1.0)
 
         # Parse pixel data - handle both numpy array and bytes formats
         r, g, b = 0, 0, 0
@@ -1558,7 +1684,7 @@ class OpenGLWidget(QOpenGLWidget):
 
         # Restore state
         glPopAttrib()
-        glClearColor(0.1, 0.1, 0.1, 1.0)
+        glClearColor(0.7, 0.7, 0.7, 1.0)
 
         # Decode triangle index from color
         r, g, b = 0, 0, 0
@@ -1741,3 +1867,688 @@ class OpenGLWidget(QOpenGLWidget):
         ]
 
         self.update()
+
+    def set_view_mode(self, mode, layer_thickness=None):
+        """Set the view mode to 'layout' or 'slice'"""
+        self.view_mode = mode
+        if layer_thickness is not None:
+            self.layer_thickness = layer_thickness
+
+        if mode == 'slice':
+            # Generate slices for all models
+            self.slice_all_models()
+            self.current_layer_index = 0
+
+            # Generate hatching if enabled and parameters are set
+            if self.hatching_enabled and self.hatching_params:
+                self.generate_all_hatching()
+        else:
+            # Clear slices and hatching
+            self.sliced_layers = []
+            self.hatching_data = {}
+
+        self.update()
+
+    def update_slice_thickness(self, layer_thickness):
+        """Update the layer thickness and re-slice"""
+        self.layer_thickness = layer_thickness
+        if self.view_mode == 'slice':
+            self.slice_all_models()
+            self.update()
+
+    def set_current_layer(self, layer_index):
+        """Set the current layer index for slice view"""
+        self.current_layer_index = layer_index
+        self.update()
+
+    def slice_all_models(self):
+        """Slice all loaded models into layers"""
+        self.sliced_layers = []
+
+        for model_data in self.models:
+            layers = self.slice_model(model_data)
+            self.sliced_layers.append(layers)
+
+    def slice_model(self, model_data):
+        """Slice a single model into horizontal sections with unique outlines
+
+        Returns a list of sections, where each section represents a range of layers
+        with the same outline shape
+        """
+        cad_model = model_data.get('model')
+        if not cad_model or not cad_model.vertices or not cad_model.indices:
+            return []
+
+        # Get model bounds and transformation
+        model_bounds = model_data.get('bounds')
+        position = model_data.get('position', [0, 0, 0])
+        rotation = model_data.get('rotation', [0, 0, 0])
+        scale = model_data.get('scale', [1, 1, 1])
+
+        if not model_bounds:
+            return []
+
+        min_x, min_y, min_z, max_x, max_y, max_z = model_bounds
+
+        # Calculate model height in world space (after transformations)
+        model_height = (max_y - min_y) * scale[1]
+        model_bottom = position[1]  # Bottom of model sits at Y=0 + position offset
+
+        # Calculate number of layers
+        num_layers = int(np.ceil(model_height / self.layer_thickness))
+        if num_layers == 0:
+            return []
+
+        # Slice all layers first
+        all_layers = []
+        for layer_idx in range(num_layers):
+            layer_z = model_bottom + (layer_idx + 0.5) * self.layer_thickness
+            segments = self.slice_at_height(cad_model, model_data, layer_z)
+            all_layers.append({
+                'z_height': layer_z,
+                'layer_index': layer_idx,
+                'segments': segments
+            })
+
+        # Group consecutive layers with the same outline into sections
+        sections = self.group_layers_into_sections(all_layers, model_bottom)
+
+        return sections
+
+    def group_layers_into_sections(self, all_layers, model_bottom):
+        """Group consecutive layers with identical outlines into sections
+
+        Returns a list of sections:
+        [{
+            'start_layer': int,
+            'end_layer': int,
+            'z_start': float,
+            'z_end': float,
+            'segments': [...],
+            'layer_count': int
+        }, ...]
+        """
+        if not all_layers:
+            return []
+
+        sections = []
+        current_section = {
+            'start_layer': 0,
+            'end_layer': 0,
+            'z_start': all_layers[0]['z_height'],
+            'z_end': all_layers[0]['z_height'],
+            'segments': all_layers[0]['segments'],
+            'layer_count': 1
+        }
+
+        for i in range(1, len(all_layers)):
+            current_layer = all_layers[i]
+            prev_layer = all_layers[i - 1]
+
+            # Check if this layer has the same outline as the previous
+            if self.outlines_are_equal(current_layer['segments'], prev_layer['segments']):
+                # Extend current section
+                current_section['end_layer'] = i
+                current_section['z_end'] = current_layer['z_height']
+                current_section['layer_count'] += 1
+            else:
+                # Save current section and start a new one
+                sections.append(current_section)
+                current_section = {
+                    'start_layer': i,
+                    'end_layer': i,
+                    'z_start': current_layer['z_height'],
+                    'z_end': current_layer['z_height'],
+                    'segments': current_layer['segments'],
+                    'layer_count': 1
+                }
+
+        # Don't forget the last section
+        sections.append(current_section)
+
+        return sections
+
+    def outlines_are_equal(self, segments1, segments2, tolerance=0.01):
+        """Check if two sets of outline segments are equal (within tolerance)
+
+        Two outlines are considered equal if they have the same number of segments
+        and each segment matches (order may differ)
+        """
+        if len(segments1) != len(segments2):
+            return False
+
+        if len(segments1) == 0:
+            return True
+
+        # Sort segments for comparison
+        # Sort by first point, then second point
+        def segment_key(seg):
+            x1, z1, x2, z2 = seg
+            # Normalize so smaller point comes first
+            if (x1, z1) > (x2, z2):
+                x1, z1, x2, z2 = x2, z2, x1, z1
+            return (round(x1 / tolerance), round(z1 / tolerance),
+                    round(x2 / tolerance), round(z2 / tolerance))
+
+        sorted_seg1 = sorted(segments1, key=segment_key)
+        sorted_seg2 = sorted(segments2, key=segment_key)
+
+        # Compare each segment
+        for seg1, seg2 in zip(sorted_seg1, sorted_seg2):
+            x1_1, z1_1, x2_1, z2_1 = seg1
+            x1_2, z1_2, x2_2, z2_2 = seg2
+
+            # Check if segments match (considering both orderings)
+            if not (self.points_equal((x1_1, z1_1), (x1_2, z1_2), tolerance) and
+                    self.points_equal((x2_1, z2_1), (x2_2, z2_2), tolerance)) and \
+               not (self.points_equal((x1_1, z1_1), (x2_2, z2_2), tolerance) and
+                    self.points_equal((x2_1, z2_1), (x1_2, z1_2), tolerance)):
+                return False
+
+        return True
+
+    def points_equal(self, p1, p2, tolerance=0.01):
+        """Check if two 2D points are equal within tolerance"""
+        return abs(p1[0] - p2[0]) < tolerance and abs(p1[1] - p2[1]) < tolerance
+
+    def slice_at_height(self, cad_model, model_data, z_height):
+        """Find all line segments where triangles intersect a horizontal plane at z_height
+
+        Returns a list of line segments [(x1, y1, x2, y2), ...]
+        """
+        vertices = np.array(cad_model.vertices)
+        indices = cad_model.indices
+
+        # Get transformation parameters
+        position = model_data.get('position', [0, 0, 0])
+        rotation = model_data.get('rotation', [0, 0, 0])
+        scale = model_data.get('scale', [1, 1, 1])
+        model_bounds = model_data.get('bounds')
+        model_center = model_data.get('center')
+
+        if not model_bounds:
+            return []
+
+        min_x, min_y, min_z, max_x, max_y, max_z = model_bounds
+
+        segments = []
+
+        # Process each triangle
+        num_triangles = len(indices) // 3
+        for tri_idx in range(num_triangles):
+            i0 = indices[tri_idx * 3]
+            i1 = indices[tri_idx * 3 + 1]
+            i2 = indices[tri_idx * 3 + 2]
+
+            # Get triangle vertices
+            v0 = np.array(vertices[i0])
+            v1 = np.array(vertices[i1])
+            v2 = np.array(vertices[i2])
+
+            # Apply transformations to get world space coordinates
+            v0_world = self.transform_vertex(v0, model_data)
+            v1_world = self.transform_vertex(v1, model_data)
+            v2_world = self.transform_vertex(v2, model_data)
+
+            # Check if triangle intersects the Z plane
+            segment = self.intersect_triangle_plane(v0_world, v1_world, v2_world, z_height)
+            if segment:
+                segments.append(segment)
+
+        return segments
+
+    def transform_vertex(self, vertex, model_data):
+        """Transform a vertex from model space to world space
+
+        This must match the transformation pipeline in draw_cad_model exactly
+        """
+        position = model_data.get('position', [0, 0, 0])
+        rotation = model_data.get('rotation', [0, 0, 0])
+        scale = model_data.get('scale', [1, 1, 1])
+        model_bounds = model_data.get('bounds')
+        model_center = model_data.get('center')
+
+        if not model_bounds:
+            return vertex
+
+        min_x, min_y, min_z, max_x, max_y, max_z = model_bounds
+
+        # Start with the vertex in model space
+        v = np.array(vertex, dtype=float)
+
+        # Step 1: Center the model (align bottom to Y=0, center in X and Z)
+        v[0] -= model_center[0]
+        v[1] -= min_y
+        v[2] -= model_center[2]
+
+        # Step 2: Apply scale around geometric center
+        center_y = (max_y - min_y) / 2
+        center_x = model_center[0]
+        center_z = model_center[2]
+
+        # Translate to geometric center
+        v[0] -= center_x
+        v[1] -= center_y
+        v[2] -= center_z
+
+        # Apply scale
+        v = v * scale
+
+        # Translate back
+        v[0] += center_x
+        v[1] += center_y
+        v[2] += center_z
+
+        # Step 3: Apply rotation around geometric center
+        # Translate to geometric center
+        v[0] -= center_x
+        v[1] -= center_y
+        v[2] -= center_z
+
+        # Apply rotations in order: Z, Y, X
+        # Convert degrees to radians
+        rx = np.radians(rotation[0])
+        ry = np.radians(rotation[1])
+        rz = np.radians(rotation[2])
+
+        # Z rotation
+        if abs(rz) > 1e-6:
+            cos_z = np.cos(rz)
+            sin_z = np.sin(rz)
+            x_new = v[0] * cos_z - v[1] * sin_z
+            y_new = v[0] * sin_z + v[1] * cos_z
+            v[0] = x_new
+            v[1] = y_new
+
+        # Y rotation
+        if abs(ry) > 1e-6:
+            cos_y = np.cos(ry)
+            sin_y = np.sin(ry)
+            x_new = v[0] * cos_y + v[2] * sin_y
+            z_new = -v[0] * sin_y + v[2] * cos_y
+            v[0] = x_new
+            v[2] = z_new
+
+        # X rotation
+        if abs(rx) > 1e-6:
+            cos_x = np.cos(rx)
+            sin_x = np.sin(rx)
+            y_new = v[1] * cos_x - v[2] * sin_x
+            z_new = v[1] * sin_x + v[2] * cos_x
+            v[1] = y_new
+            v[2] = z_new
+
+        # Translate back
+        v[0] += center_x
+        v[1] += center_y
+        v[2] += center_z
+
+        # Step 4: Apply position translation
+        v = v + position
+
+        return v
+
+    def intersect_triangle_plane(self, v0, v1, v2, z_height):
+        """Find where a triangle intersects a horizontal plane at z_height
+
+        Returns a line segment (x1, y1, x2, y2) or None if no intersection
+        Note: y here refers to the horizontal plane coordinate (model's Z in our system)
+        """
+        # Check which vertices are above and below the plane
+        # We're slicing on the Y axis (vertical in our system)
+        y0, y1, y2 = v0[1], v1[1], v2[1]
+
+        # Find intersection points
+        intersections = []
+
+        # Check edge v0-v1
+        if (y0 <= z_height <= y1) or (y1 <= z_height <= y0):
+            if abs(y1 - y0) > 1e-6:  # Avoid division by zero
+                t = (z_height - y0) / (y1 - y0)
+                x = v0[0] + t * (v1[0] - v0[0])
+                z = v0[2] + t * (v1[2] - v0[2])
+                intersections.append((x, z))
+
+        # Check edge v1-v2
+        if (y1 <= z_height <= y2) or (y2 <= z_height <= y1):
+            if abs(y2 - y1) > 1e-6:
+                t = (z_height - y1) / (y2 - y1)
+                x = v1[0] + t * (v2[0] - v1[0])
+                z = v1[2] + t * (v2[2] - v1[2])
+                intersections.append((x, z))
+
+        # Check edge v2-v0
+        if (y2 <= z_height <= y0) or (y0 <= z_height <= y2):
+            if abs(y0 - y2) > 1e-6:
+                t = (z_height - y2) / (y0 - y2)
+                x = v2[0] + t * (v0[0] - v2[0])
+                z = v2[2] + t * (v0[2] - v2[2])
+                intersections.append((x, z))
+
+        # Remove duplicates
+        unique_intersections = []
+        for p in intersections:
+            is_duplicate = False
+            for existing in unique_intersections:
+                if abs(p[0] - existing[0]) < 1e-6 and abs(p[1] - existing[1]) < 1e-6:
+                    is_duplicate = True
+                    break
+            if not is_duplicate:
+                unique_intersections.append(p)
+
+        # Should have exactly 2 intersection points for a valid slice
+        if len(unique_intersections) == 2:
+            p1, p2 = unique_intersections
+            return (p1[0], p1[1], p2[0], p2[1])
+
+        return None
+
+    def draw_sliced_layers(self):
+        """Draw the current layer's outlines for all models"""
+        if not self.sliced_layers:
+            return
+
+        # Disable lighting for line drawing
+        glDisable(GL_LIGHTING)
+        glLineWidth(2.0)
+
+        # Draw each model's sections
+        for model_idx, model_sections in enumerate(self.sliced_layers):
+            if not model_sections:
+                continue
+
+            # Find which section contains the current layer index
+            section = self.find_section_for_layer(model_sections, self.current_layer_index)
+            if not section:
+                continue
+
+            segments = section['segments']
+            # Use the middle Z height of the section for display
+            z_height = (section['z_start'] + section['z_end']) / 2
+
+            # Set color - use different colors for different models
+            if model_idx == self.selected_model_index:
+                glColor3f(0.2, 0.4, 0.9)  # Blue for selected
+            else:
+                glColor3f(0.2, 0.2, 0.2)  # Dark gray for unselected
+
+            # Draw all segments
+            glBegin(GL_LINES)
+            for seg in segments:
+                x1, z1, x2, z2 = seg
+                # Remember: in our coordinate system, the slice Y is the world Y
+                glVertex3f(x1, z_height, z1)
+                glVertex3f(x2, z_height, z2)
+            glEnd()
+
+        # Draw hatching if enabled
+        if self.hatching_enabled:
+            self.draw_hatching_for_layer(self.current_layer_index)
+
+        # Re-enable lighting
+        glEnable(GL_LIGHTING)
+
+    def find_section_for_layer(self, sections, layer_index):
+        """Find the section that contains the given layer index"""
+        for section in sections:
+            if section['start_layer'] <= layer_index <= section['end_layer']:
+                return section
+        return None
+
+    def get_total_layers(self):
+        """Get the total number of layers across all models"""
+        if not self.sliced_layers:
+            return 0
+
+        max_layers = 0
+        for model_sections in self.sliced_layers:
+            if model_sections:
+                # Find the highest end_layer across all sections
+                for section in model_sections:
+                    max_layers = max(max_layers, section['end_layer'] + 1)
+
+        return max_layers
+
+    def draw_scrollbar_gizmo(self):
+        """Draw a scrollbar gizmo on the right side of the viewport for layer navigation"""
+        if not self.sliced_layers:
+            return
+
+        total_layers = self.get_total_layers()
+        if total_layers <= 0:
+            return
+
+        # Switch to 2D orthographic projection for UI overlay
+        glMatrixMode(GL_PROJECTION)
+        glPushMatrix()
+        glLoadIdentity()
+        glOrtho(0, self.width(), self.height(), 0, -1, 1)
+
+        glMatrixMode(GL_MODELVIEW)
+        glPushMatrix()
+        glLoadIdentity()
+
+        # Disable depth test and lighting for 2D overlay
+        glDisable(GL_DEPTH_TEST)
+        glDisable(GL_LIGHTING)
+
+        # Calculate scrollbar dimensions
+        viewport_height = self.height()
+        scrollbar_x = self.width() - self.scrollbar_width - self.scrollbar_margin
+        scrollbar_y = self.scrollbar_margin
+        scrollbar_height = viewport_height - 2 * self.scrollbar_margin
+
+        # Draw scrollbar track (background)
+        glColor4f(0.3, 0.3, 0.3, 0.5)
+        glBegin(GL_QUADS)
+        glVertex2f(scrollbar_x, scrollbar_y)
+        glVertex2f(scrollbar_x + self.scrollbar_width, scrollbar_y)
+        glVertex2f(scrollbar_x + self.scrollbar_width, scrollbar_y + scrollbar_height)
+        glVertex2f(scrollbar_x, scrollbar_y + scrollbar_height)
+        glEnd()
+
+        # Calculate thumb position and size
+        thumb_height = max(20, scrollbar_height / max(total_layers, 1))
+        thumb_y = scrollbar_y + (scrollbar_height - thumb_height) * (self.current_layer_index / max(total_layers - 1, 1))
+
+        # Draw scrollbar thumb (handle)
+        if self.scrollbar_hover or self.scrollbar_dragging:
+            glColor4f(0.6, 0.6, 0.8, 0.9)  # Lighter when hovered/dragging
+        else:
+            glColor4f(0.4, 0.4, 0.6, 0.8)  # Normal color
+
+        glBegin(GL_QUADS)
+        glVertex2f(scrollbar_x + 2, thumb_y)
+        glVertex2f(scrollbar_x + self.scrollbar_width - 2, thumb_y)
+        glVertex2f(scrollbar_x + self.scrollbar_width - 2, thumb_y + thumb_height)
+        glVertex2f(scrollbar_x + 2, thumb_y + thumb_height)
+        glEnd()
+
+        # Store layer info for text rendering
+        self.slice_info_text = f"{self.current_layer_index + 1}/{total_layers}"
+        self.slice_info_position = (scrollbar_x - 60, scrollbar_y + scrollbar_height // 2)
+
+        # Restore matrices and state
+        glPopMatrix()
+        glMatrixMode(GL_PROJECTION)
+        glPopMatrix()
+        glMatrixMode(GL_MODELVIEW)
+
+        glEnable(GL_DEPTH_TEST)
+        glEnable(GL_LIGHTING)
+
+        # Store scrollbar info for mouse interaction
+        self.scrollbar_rect = (scrollbar_x, scrollbar_y, self.scrollbar_width, scrollbar_height)
+        self.scrollbar_thumb_rect = (scrollbar_x, thumb_y, self.scrollbar_width, thumb_height)
+
+    def is_point_in_scrollbar(self, x, y):
+        """Check if a point is inside the scrollbar area"""
+        if not hasattr(self, 'scrollbar_rect'):
+            return False
+        sx, sy, sw, sh = self.scrollbar_rect
+        return sx <= x <= sx + sw and sy <= y <= sy + sh
+
+    def handle_scrollbar_click(self, y):
+        """Handle click on scrollbar"""
+        if not hasattr(self, 'scrollbar_rect'):
+            return
+
+        sx, sy, sw, sh = self.scrollbar_rect
+        total_layers = self.get_total_layers()
+        if total_layers <= 0:
+            return
+
+        # Calculate which layer was clicked based on Y position
+        relative_y = y - sy
+        layer_index = int((relative_y / sh) * total_layers)
+        layer_index = max(0, min(total_layers - 1, layer_index))
+
+        self.set_current_layer(layer_index)
+
+    def handle_scrollbar_drag(self, y):
+        """Handle dragging the scrollbar"""
+        self.handle_scrollbar_click(y)
+    # ============================================================================
+    # Hatching Integration Methods
+    # ============================================================================
+
+    def enable_hatching(self, enabled=True):
+        """Enable or disable hatching visualization in slice mode."""
+        self.hatching_enabled = enabled
+        self.update()
+
+    def set_hatching_parameters(self, hatch_params, strategy=None):
+        """
+        Set hatching parameters and optionally strategy.
+
+        Args:
+            hatch_params: HatchingParameters instance
+            strategy: HatchingStrategy enum value (optional)
+        """
+        from hatching import HatchingParameters, HatchingStrategy
+
+        self.hatching_params = hatch_params
+        if strategy is not None:
+            self.hatching_strategy = strategy
+        elif self.hatching_strategy is None:
+            self.hatching_strategy = HatchingStrategy.LINES
+
+        # Regenerate hatching if in slice mode
+        if self.view_mode == 'slice' and self.hatching_enabled:
+            self.generate_all_hatching()
+            self.update()
+
+    def generate_all_hatching(self):
+        """Generate hatching for all sliced layers."""
+        if not self.sliced_layers or not self.hatching_params:
+            return
+
+        from hatching_integration import prepare_hatching_for_all_layers
+
+        self.hatching_data = {}
+
+        # Generate hatching for each model
+        for model_idx, layer_sections in enumerate(self.sliced_layers):
+            model_hatching = prepare_hatching_for_all_layers(
+                layer_sections,
+                self.hatching_params,
+                self.hatching_strategy
+            )
+
+            # Merge into main hatching data
+            for layer_idx, hatch_lines in model_hatching.items():
+                if layer_idx not in self.hatching_data:
+                    self.hatching_data[layer_idx] = []
+                self.hatching_data[layer_idx].extend(hatch_lines)
+
+    def draw_hatching_for_layer(self, layer_index):
+        """
+        Render hatching lines for a specific layer.
+
+        Args:
+            layer_index: Layer index to render
+        """
+        if not self.hatching_enabled or layer_index not in self.hatching_data:
+            return
+
+        hatch_lines = self.hatching_data[layer_index]
+
+        glDisable(GL_LIGHTING)
+        glDisable(GL_DEPTH_TEST)
+
+        # Draw contour lines (red, thicker)
+        contour_lines = [line for line in hatch_lines if line.is_contour]
+        if contour_lines:
+            glColor3f(0.8, 0.1, 0.1)  # Red
+            glLineWidth(2.0)
+            glBegin(GL_LINES)
+            for line in contour_lines:
+                # Note: segments are (x, z) but we render in 3D (x, y, z)
+                # where y is the height dimension
+                layer_y = layer_index * self.layer_thickness
+                glVertex3f(line.start[0], layer_y, line.start[1])
+                glVertex3f(line.end[0], layer_y, line.end[1])
+            glEnd()
+
+        # Draw infill lines (blue, thinner)
+        infill_lines = [line for line in hatch_lines if not line.is_contour]
+        if infill_lines:
+            glColor3f(0.1, 0.4, 0.8)  # Blue
+            glLineWidth(1.0)
+            glBegin(GL_LINES)
+            for line in infill_lines:
+                layer_y = layer_index * self.layer_thickness
+                glVertex3f(line.start[0], layer_y, line.start[1])
+                glVertex3f(line.end[0], layer_y, line.end[1])
+            glEnd()
+
+        glLineWidth(1.0)
+        glEnable(GL_DEPTH_TEST)
+        glEnable(GL_LIGHTING)
+
+    def get_hatching_statistics(self):
+        """
+        Get statistics about generated hatching.
+
+        Returns:
+            Dictionary with statistics or None if no hatching
+        """
+        if not self.hatching_data:
+            return None
+
+        from hatching_integration import get_hatching_statistics
+        return get_hatching_statistics(self.hatching_data)
+
+    def export_to_obp(self, filepath):
+        """
+        Export sliced and hatched model to OBP format for Freemelt.
+
+        Args:
+            filepath: Path to save OBP file
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if not self.hatching_data:
+            return False
+
+        try:
+            from hatching_integration import convert_hatching_to_obp_format
+
+            # Convert hatching data to OBP format
+            obp_layers = convert_hatching_to_obp_format(
+                self.hatching_data,
+                self.layer_thickness
+            )
+
+            # TODO: Use obplib from Freemelt to write OBP file
+            # This is a placeholder until obplib integration is complete
+            import json
+            with open(filepath, 'w') as f:
+                json.dump(obp_layers, f, indent=2)
+
+            return True
+
+        except Exception as e:
+            print(f"Export error: {e}")
+            return False

@@ -9,6 +9,10 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QFont
 import numpy as np
+from constants import (
+    POSITION_MIN, POSITION_MAX, SCALE_MIN, SCALE_MAX,
+    ROTATION_MIN, ROTATION_MAX, TRANSFORM_DIALOG_MIN_WIDTH
+)
 
 
 class TransformDialog(QDialog):
@@ -24,7 +28,7 @@ class TransformDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Transform")
         self.setWindowFlags(Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
-        self.setMinimumWidth(280)
+        self.setMinimumWidth(TRANSFORM_DIALOG_MIN_WIDTH)
 
         # Track linked scaling state
         self.scale_linked = True
@@ -77,7 +81,7 @@ class TransformDialog(QDialog):
         # X position
         grid.addWidget(QLabel("X:"), 0, 0)
         self.pos_x = QDoubleSpinBox()
-        self.pos_x.setRange(-1000, 1000)
+        self.pos_x.setRange(POSITION_MIN, POSITION_MAX)
         self.pos_x.setDecimals(2)
         self.pos_x.setSuffix(" mm")
         self.pos_x.valueChanged.connect(self.on_position_changed)
@@ -86,7 +90,7 @@ class TransformDialog(QDialog):
         # Y position
         grid.addWidget(QLabel("Y:"), 1, 0)
         self.pos_y = QDoubleSpinBox()
-        self.pos_y.setRange(-1000, 1000)
+        self.pos_y.setRange(POSITION_MIN, POSITION_MAX)
         self.pos_y.setDecimals(2)
         self.pos_y.setSuffix(" mm")
         self.pos_y.valueChanged.connect(self.on_position_changed)
@@ -95,7 +99,7 @@ class TransformDialog(QDialog):
         # Z position
         grid.addWidget(QLabel("Z:"), 2, 0)
         self.pos_z = QDoubleSpinBox()
-        self.pos_z.setRange(-1000, 1000)
+        self.pos_z.setRange(POSITION_MIN, POSITION_MAX)
         self.pos_z.setDecimals(2)
         self.pos_z.setSuffix(" mm")
         self.pos_z.valueChanged.connect(self.on_position_changed)
@@ -136,7 +140,7 @@ class TransformDialog(QDialog):
         # X scale
         grid.addWidget(QLabel("X:"), 1, 0)
         self.scale_x = QDoubleSpinBox()
-        self.scale_x.setRange(0.01, 100)
+        self.scale_x.setRange(SCALE_MIN, SCALE_MAX)
         self.scale_x.setDecimals(3)
         self.scale_x.setValue(1.0)
         self.scale_x.setSingleStep(0.1)
@@ -146,7 +150,7 @@ class TransformDialog(QDialog):
         # Y scale
         grid.addWidget(QLabel("Y:"), 2, 0)
         self.scale_y = QDoubleSpinBox()
-        self.scale_y.setRange(0.01, 100)
+        self.scale_y.setRange(SCALE_MIN, SCALE_MAX)
         self.scale_y.setDecimals(3)
         self.scale_y.setValue(1.0)
         self.scale_y.setSingleStep(0.1)
@@ -156,7 +160,7 @@ class TransformDialog(QDialog):
         # Z scale
         grid.addWidget(QLabel("Z:"), 3, 0)
         self.scale_z = QDoubleSpinBox()
-        self.scale_z.setRange(0.01, 100)
+        self.scale_z.setRange(SCALE_MIN, SCALE_MAX)
         self.scale_z.setDecimals(3)
         self.scale_z.setValue(1.0)
         self.scale_z.setSingleStep(0.1)
@@ -198,7 +202,7 @@ class TransformDialog(QDialog):
         # X rotation
         grid.addWidget(QLabel("X:"), 0, 0)
         self.rot_x = QDoubleSpinBox()
-        self.rot_x.setRange(-360, 360)
+        self.rot_x.setRange(ROTATION_MIN, ROTATION_MAX)
         self.rot_x.setDecimals(1)
         self.rot_x.setSuffix("°")
         self.rot_x.valueChanged.connect(self.on_rotation_changed)
@@ -207,7 +211,7 @@ class TransformDialog(QDialog):
         # Y rotation
         grid.addWidget(QLabel("Y:"), 1, 0)
         self.rot_y = QDoubleSpinBox()
-        self.rot_y.setRange(-360, 360)
+        self.rot_y.setRange(ROTATION_MIN, ROTATION_MAX)
         self.rot_y.setDecimals(1)
         self.rot_y.setSuffix("°")
         self.rot_y.valueChanged.connect(self.on_rotation_changed)
@@ -216,7 +220,7 @@ class TransformDialog(QDialog):
         # Z rotation
         grid.addWidget(QLabel("Z:"), 2, 0)
         self.rot_z = QDoubleSpinBox()
-        self.rot_z.setRange(-360, 360)
+        self.rot_z.setRange(ROTATION_MIN, ROTATION_MAX)
         self.rot_z.setDecimals(1)
         self.rot_z.setSuffix("°")
         self.rot_z.valueChanged.connect(self.on_rotation_changed)

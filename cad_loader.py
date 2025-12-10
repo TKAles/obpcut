@@ -18,7 +18,13 @@ from OCP.gp import gp_Pnt
 from OCP.Bnd import Bnd_Box
 from OCP.BRepBndLib import BRepBndLib
 import numpy as np
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Callable
+import traceback
+
+# Constants for tessellation quality
+LINEAR_DEFLECTION = 0.1  # mm - very fine tessellation
+ANGULAR_DEFLECTION = 0.1  # radians - smooth curves
+UNIT_SCALE = 1.0  # Scale factor for unit conversion
 
 
 class CADModel:
@@ -65,8 +71,30 @@ def load_cad_file(file_path: str) -> Optional[CADModel]:
     Returns:
         CADModel object with BREP data, or None if loading failed
     """
+    return load_cad_file_with_progress(file_path, None)
+
+
+def load_cad_file_with_progress(
+    file_path: str,
+    progress_callback: Optional[Callable[[str, str], None]] = None
+) -> Optional[CADModel]:
+    """
+    Load a CAD file with progress reporting (thread-safe).
+
+    Args:
+        file_path: Path to the STEP or IGES file
+        progress_callback: Optional callback(stage, message) for progress updates
+
+    Returns:
+        CADModel object with BREP data, or None if loading failed
+    """
+    def report_progress(stage: str, message: str):
+        """Helper to report progress if callback is provided."""
+        if progress_callback:
+            progress_callback(stage, message)
+
     try:
-        print(f"Loading CAD file: {file_path}")
+        report_progress("loading", f"Loading CAD file: {file_path}")
 
         # Determine file type and load
         file_path_lower = file_path.lower()
@@ -74,51 +102,47 @@ def load_cad_file(file_path: str) -> Optional[CADModel]:
 
         if file_path_lower.endswith('.step') or file_path_lower.endswith('.stp'):
             # Load STEP file
+            report_progress("reading", "Reading STEP file...")
             reader = STEPControl_Reader()
             status = reader.ReadFile(file_path)
 
             if status != IFSelect_ReturnStatus.IFSelect_RetDone:
-                print(f"Error reading STEP file")
-                return None
+                raise ValueError("Error reading STEP file")
 
+            report_progress("transferring", "Transferring STEP data...")
             reader.TransferRoots()
             shape = reader.OneShape()
 
         elif file_path_lower.endswith('.iges') or file_path_lower.endswith('.igs'):
             # Load IGES file
+            report_progress("reading", "Reading IGES file...")
             reader = IGESControl_Reader()
             status = reader.ReadFile(file_path)
 
             if status != IFSelect_ReturnStatus.IFSelect_RetDone:
-                print(f"Error reading IGES file")
-                return None
+                raise ValueError("Error reading IGES file")
 
+            report_progress("transferring", "Transferring IGES data...")
             reader.TransferRoots()
             shape = reader.OneShape()
         else:
-            print(f"Unsupported file format: {file_path}")
-            return None
+            raise ValueError(f"Unsupported file format: {file_path}")
 
         if not shape:
-            print("Failed to load shape from file")
-            return None
+            raise ValueError("Failed to load shape from file")
 
-        print(f"Shape loaded successfully, tessellating...")
+        report_progress("tessellating", "Tessellating geometry...")
 
         # Tessellate the shape with high quality settings for BREP appearance
-        # Linear deflection controls how closely the mesh follows the surface
-        # Angular deflection controls smoothness of curved surfaces
-        linear_deflection = 0.1  # mm - very fine tessellation
-        angular_deflection = 0.1  # radians - smooth curves
-
-        mesh = BRepMesh_IncrementalMesh(shape, linear_deflection, False, angular_deflection, True)
+        mesh = BRepMesh_IncrementalMesh(
+            shape, LINEAR_DEFLECTION, False, ANGULAR_DEFLECTION, True
+        )
         mesh.Perform()
 
         if not mesh.IsDone():
-            print("Tessellation failed")
-            return None
+            raise RuntimeError("Tessellation failed")
 
-        print("Tessellation complete, extracting geometry...")
+        report_progress("extracting", "Extracting geometry...")
 
         # Create CADModel to store the data
         model = CADModel()
@@ -128,13 +152,10 @@ def load_cad_file(file_path: str) -> Optional[CADModel]:
         BRepBndLib.Add_s(shape, bbox)
         xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
 
-        # STEP files are typically in millimeters, but can vary
-        # We'll keep the original scale and let the user adjust if needed
-        unit_scale = 1.0
-
         model.bounds = (xmin, ymin, zmin, xmax, ymax, zmax)
 
         # Extract faces (surfaces)
+        report_progress("extracting", "Extracting faces...")
         face_explorer = TopExp_Explorer(shape, TopAbs_FACE)
         vertex_offset = 0
 
@@ -156,7 +177,11 @@ def load_cad_file(file_path: str) -> Optional[CADModel]:
                     # Apply transformation
                     pnt.Transform(transform)
                     # Apply unit scaling
-                    face_vertices.append([pnt.X() * unit_scale, pnt.Y() * unit_scale, pnt.Z() * unit_scale])
+                    face_vertices.append([
+                        pnt.X() * UNIT_SCALE,
+                        pnt.Y() * UNIT_SCALE,
+                        pnt.Z() * UNIT_SCALE
+                    ])
 
                 # Extract triangles
                 num_triangles = triangulation.NbTriangles()
@@ -179,7 +204,7 @@ def load_cad_file(file_path: str) -> Optional[CADModel]:
             face_explorer.Next()
 
         # Extract edges for BREP-style outline rendering
-        # Use curve discretization for edges
+        report_progress("extracting", "Extracting edges...")
         from OCP.BRepAdaptor import BRepAdaptor_Curve
         from OCP.GCPnts import GCPnts_UniformDeflection
 
@@ -194,7 +219,7 @@ def load_cad_file(file_path: str) -> Optional[CADModel]:
                 curve_adaptor = BRepAdaptor_Curve(edge)
 
                 # Discretize the curve with the same deflection as the mesh
-                discretizer = GCPnts_UniformDeflection(curve_adaptor, linear_deflection)
+                discretizer = GCPnts_UniformDeflection(curve_adaptor, LINEAR_DEFLECTION)
 
                 if discretizer.IsDone() and discretizer.NbPoints() > 1:
                     num_points = discretizer.NbPoints()
@@ -202,7 +227,11 @@ def load_cad_file(file_path: str) -> Optional[CADModel]:
                     # Extract points along the edge
                     for i in range(1, num_points + 1):
                         pnt = discretizer.Value(i)
-                        model.edge_vertices.append([pnt.X() * unit_scale, pnt.Y() * unit_scale, pnt.Z() * unit_scale])
+                        model.edge_vertices.append([
+                            pnt.X() * UNIT_SCALE,
+                            pnt.Y() * UNIT_SCALE,
+                            pnt.Z() * UNIT_SCALE
+                        ])
 
                     # Create line segments
                     for i in range(num_points - 1):
@@ -212,15 +241,15 @@ def load_cad_file(file_path: str) -> Optional[CADModel]:
                         ])
 
                     edge_vertex_offset = len(model.edge_vertices)
-            except:
-                # Skip edges that fail
+            except Exception as e:
+                # Skip edges that fail (degenerate edges, etc.)
+                # This is expected for some edge cases in CAD models
                 pass
 
             edge_explorer.Next()
 
-        print(f"Geometry extracted: {len(model.vertices)} vertices, {len(model.indices)//3} triangles, {len(model.edge_indices)//2} edge segments")
-
         # Calculate vertex normals
+        report_progress("computing", "Computing normals...")
         vertex_normals = [[0.0, 0.0, 0.0] for _ in range(len(model.vertices))]
 
         # Calculate face normals and accumulate to vertices
@@ -259,13 +288,20 @@ def load_cad_file(file_path: str) -> Optional[CADModel]:
         model.normals = vertex_normals
 
         min_x, min_y, min_z, max_x, max_y, max_z = model.bounds
-        print(f"Bounds (mm): ({min_x:.2f}, {min_y:.2f}, {min_z:.2f}) to ({max_x:.2f}, {max_y:.2f}, {max_z:.2f})")
-        print(f"Model size: {max_x - min_x:.2f} x {max_y - min_y:.2f} x {max_z - min_z:.2f} mm")
+
+        report_progress("complete", "Loading complete!")
+        print(f"Geometry extracted: {len(model.vertices)} vertices, "
+              f"{len(model.indices)//3} triangles, {len(model.edge_indices)//2} edge segments")
+        print(f"Bounds (mm): ({min_x:.2f}, {min_y:.2f}, {min_z:.2f}) to "
+              f"({max_x:.2f}, {max_y:.2f}, {max_z:.2f})")
+        print(f"Model size: {max_x - min_x:.2f} x {max_y - min_y:.2f} x "
+              f"{max_z - min_z:.2f} mm")
 
         return model
 
     except Exception as e:
-        print(f"Error loading CAD file: {e}")
-        import traceback
+        error_msg = f"Error loading CAD file: {e}"
+        print(error_msg)
         traceback.print_exc()
+        report_progress("error", error_msg)
         return None

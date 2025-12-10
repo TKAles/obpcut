@@ -31,6 +31,7 @@ PyQt6-Qt6==6.10.1
 PyQt6_sip==13.10.3
 python-dateutil==2.9.0.post0
 PyYAML==6.0.3
+shapely==2.0.6
 six==1.17.0
 trame==3.12.0
 trame-client==3.11.2
