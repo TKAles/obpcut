@@ -175,9 +175,9 @@ class SlicingWorker(QThread):
 
         # Get model bounds and transformation
         model_bounds = model_data.get('bounds')
-        position = model_data.get('position', [0, 0, 0])
-        rotation = model_data.get('rotation', [0, 0, 0])
-        scale = model_data.get('scale', [1, 1, 1])
+        position = np.asarray(model_data.get('position', [0, 0, 0]), dtype=float)
+        rotation = np.asarray(model_data.get('rotation', [0, 0, 0]), dtype=float)
+        scale = np.asarray(model_data.get('scale', [1, 1, 1]), dtype=float)
 
         if not model_bounds:
             return []
@@ -185,8 +185,10 @@ class SlicingWorker(QThread):
         min_x, min_y, min_z, max_x, max_y, max_z = model_bounds
 
         # Calculate model height in world space
-        model_height = (max_y - min_y) * scale[1]
-        model_bottom = position[1]
+        model_height = (max_y - min_y) * float(scale[1])
+        # Bottom of model sits on top of build plate (5mm) + user position offset
+        BUILD_PLATE_TOP_Y = 5.0  # Top of 10mm thick build plate
+        model_bottom = BUILD_PLATE_TOP_Y + float(position[1])
 
         # Calculate number of layers
         num_layers = int(np.ceil(model_height / layer_thickness))
@@ -220,23 +222,57 @@ class SlicingWorker(QThread):
         """Slice the model at a specific height (standalone version)."""
         import numpy as np
 
-        vertices = cad_model.vertices
-        indices = cad_model.indices
+        try:
+            # Convert to numpy arrays and flatten to ensure 1D
+            vertices_raw = cad_model.vertices
+            indices_raw = cad_model.indices
 
-        position = model_data.get('position', [0, 0, 0])
-        rotation = model_data.get('rotation', [0, 0, 0])
-        scale = model_data.get('scale', [1, 1, 1])
+            # If already numpy arrays, get the flat data; otherwise convert
+            if isinstance(vertices_raw, np.ndarray):
+                vertices = vertices_raw.flatten().astype(float)
+            else:
+                vertices = np.array(vertices_raw, dtype=float).flatten()
+
+            if isinstance(indices_raw, np.ndarray):
+                indices = indices_raw.flatten().astype(int)
+            else:
+                indices = np.array(indices_raw, dtype=int).flatten()
+
+            # Convert transformation parameters to Python lists of floats
+            position = model_data.get('position', [0, 0, 0])
+            position = [float(position[0]), float(position[1]), float(position[2])]
+
+            rotation = model_data.get('rotation', [0, 0, 0])
+            rotation = [float(rotation[0]), float(rotation[1]), float(rotation[2])]
+
+            scale = model_data.get('scale', [1, 1, 1])
+            scale = [float(scale[0]), float(scale[1]), float(scale[2])]
+
+            slice_z = float(slice_z)
+        except Exception as e:
+            raise ValueError(f"Error converting data types: {e}")
 
         segments = []
 
         # Process each triangle
         for i in range(0, len(indices), 3):
-            i0, i1, i2 = indices[i], indices[i+1], indices[i+2]
+            # Convert to Python int to avoid numpy indexing issues
+            # Use .item() to ensure we get Python ints, not numpy types
+            try:
+                i0 = indices[i].item() if hasattr(indices[i], 'item') else int(indices[i])
+                i1 = indices[i+1].item() if hasattr(indices[i+1], 'item') else int(indices[i+1])
+                i2 = indices[i+2].item() if hasattr(indices[i+2], 'item') else int(indices[i+2])
+            except (AttributeError, ValueError) as e:
+                continue
 
-            # Get triangle vertices
-            v0 = vertices[i0*3:i0*3+3]
-            v1 = vertices[i1*3:i1*3+3]
-            v2 = vertices[i2*3:i2*3+3]
+            # Get triangle vertices - use .item() to extract numpy scalars as Python floats
+            try:
+                v0 = [vertices[i0*3].item(), vertices[i0*3+1].item(), vertices[i0*3+2].item()]
+                v1 = [vertices[i1*3].item(), vertices[i1*3+1].item(), vertices[i1*3+2].item()]
+                v2 = [vertices[i2*3].item(), vertices[i2*3+1].item(), vertices[i2*3+2].item()]
+            except (AttributeError, IndexError) as e:
+                # Skip this triangle if we can't extract vertices
+                continue
 
             # Apply transformations
             v0_t = self._transform_vertex(v0, position, rotation, scale)
@@ -251,43 +287,57 @@ class SlicingWorker(QThread):
         return segments
 
     def _transform_vertex(self, vertex, position, rotation, scale):
-        """Apply transformation to a vertex."""
-        import numpy as np
+        """Apply transformation to a vertex.
 
+        Args:
+            vertex: List of 3 floats [x, y, z]
+            position: List of 3 floats [x, y, z]
+            rotation: List of 3 floats [rx, ry, rz] in degrees
+            scale: List of 3 floats [sx, sy, sz]
+
+        Returns:
+            List of 3 floats representing transformed vertex
+        """
+        import math
+
+        # All inputs are already Python lists of floats
         # Apply scale
-        v = np.array([vertex[0] * scale[0], vertex[1] * scale[1], vertex[2] * scale[2]])
+        v = [vertex[0] * scale[0], vertex[1] * scale[1], vertex[2] * scale[2]]
 
         # Apply rotation (X, Y, Z order)
         if rotation[0] != 0:  # X rotation
-            angle = np.radians(rotation[0])
-            cos_a, sin_a = np.cos(angle), np.sin(angle)
+            angle = math.radians(rotation[0])
+            cos_a, sin_a = math.cos(angle), math.sin(angle)
             y, z = v[1], v[2]
             v[1] = y * cos_a - z * sin_a
             v[2] = y * sin_a + z * cos_a
 
         if rotation[1] != 0:  # Y rotation
-            angle = np.radians(rotation[1])
-            cos_a, sin_a = np.cos(angle), np.sin(angle)
+            angle = math.radians(rotation[1])
+            cos_a, sin_a = math.cos(angle), math.sin(angle)
             x, z = v[0], v[2]
             v[0] = x * cos_a + z * sin_a
             v[2] = -x * sin_a + z * cos_a
 
         if rotation[2] != 0:  # Z rotation
-            angle = np.radians(rotation[2])
-            cos_a, sin_a = np.cos(angle), np.sin(angle)
+            angle = math.radians(rotation[2])
+            cos_a, sin_a = math.cos(angle), math.sin(angle)
             x, y = v[0], v[1]
             v[0] = x * cos_a - y * sin_a
             v[1] = x * sin_a + y * cos_a
 
         # Apply translation
-        v += np.array(position)
+        v[0] += position[0]
+        v[1] += position[1]
+        v[2] += position[2]
 
         return v
 
     def _intersect_triangle_plane(self, v0, v1, v2, plane_y):
         """Find intersection of triangle with horizontal plane."""
-        # Get Y coordinates
-        y0, y1, y2 = v0[1], v1[1], v2[1]
+        # Get Y coordinates and convert to float to avoid numpy array comparison issues
+        y0, y1, y2 = float(v0[1]), float(v1[1]), float(v2[1])
+        plane_y = float(plane_y)
 
         # Find which edges cross the plane
         edges_cross = []
@@ -296,31 +346,31 @@ class SlicingWorker(QThread):
         if (y0 <= plane_y <= y1) or (y1 <= plane_y <= y0):
             if abs(y1 - y0) > 1e-10:
                 t = (plane_y - y0) / (y1 - y0)
-                x = v0[0] + t * (v1[0] - v0[0])
-                z = v0[2] + t * (v1[2] - v0[2])
+                x = float(v0[0]) + t * (float(v1[0]) - float(v0[0]))
+                z = float(v0[2]) + t * (float(v1[2]) - float(v0[2]))
                 edges_cross.append((x, z))
 
         # Check edge v1-v2
         if (y1 <= plane_y <= y2) or (y2 <= plane_y <= y1):
             if abs(y2 - y1) > 1e-10:
                 t = (plane_y - y1) / (y2 - y1)
-                x = v1[0] + t * (v2[0] - v1[0])
-                z = v1[2] + t * (v2[2] - v1[2])
+                x = float(v1[0]) + t * (float(v2[0]) - float(v1[0]))
+                z = float(v1[2]) + t * (float(v2[2]) - float(v1[2]))
                 edges_cross.append((x, z))
 
         # Check edge v2-v0
         if (y2 <= plane_y <= y0) or (y0 <= plane_y <= y2):
             if abs(y0 - y2) > 1e-10:
                 t = (plane_y - y2) / (y0 - y2)
-                x = v2[0] + t * (v0[0] - v2[0])
-                z = v2[2] + t * (v0[2] - v2[2])
+                x = float(v2[0]) + t * (float(v0[0]) - float(v2[0]))
+                z = float(v2[2]) + t * (float(v0[2]) - float(v2[2]))
                 edges_cross.append((x, z))
 
         # Need exactly 2 intersection points
         if len(edges_cross) == 2:
             p0, p1 = edges_cross[0], edges_cross[1]
             # Return as (x1, z1, x2, z2)
-            return (p0[0], p0[1], p1[0], p1[1])
+            return (float(p0[0]), float(p0[1]), float(p1[0]), float(p1[1]))
 
         return None
 
@@ -382,4 +432,75 @@ class SlicingWorker(QThread):
 
     def cancel(self):
         """Request cancellation of the slicing operation."""
+        self._is_cancelled = True
+
+
+class HatchingWorker(QThread):
+    """
+    Specialized worker for generating hatching with progress reporting.
+
+    Signals:
+        progress: Emitted with (current_layer, total_layers, message) during hatching
+        finished: Emitted with hatching data when complete
+        error: Emitted with error message when hatching fails
+    """
+    progress = pyqtSignal(int, int, str)  # current, total, message
+    finished = pyqtSignal(dict)  # hatching data dictionary
+    error = pyqtSignal(str)  # error message
+
+    def __init__(self, sliced_layers: list, hatching_params, hatching_strategy):
+        """
+        Initialize hatching worker.
+
+        Args:
+            sliced_layers: List of sliced layer sections for all models
+            hatching_params: HatchingParameters instance
+            hatching_strategy: HatchingStrategy enum value
+        """
+        super().__init__()
+        self.sliced_layers = sliced_layers
+        self.hatching_params = hatching_params
+        self.hatching_strategy = hatching_strategy
+        self._is_cancelled = False
+
+    def run(self):
+        """Generate hatching in the background."""
+        try:
+            from hatching_integration import prepare_hatching_for_all_layers
+
+            hatching_data = {}
+
+            # Generate hatching for each model
+            for model_idx, layer_sections in enumerate(self.sliced_layers):
+                if self._is_cancelled:
+                    return
+
+                self.progress.emit(model_idx, len(self.sliced_layers),
+                                 f"Generating hatching for model {model_idx+1}/{len(self.sliced_layers)}")
+
+                # Progress callback for individual layers
+                def layer_progress(layer_idx, total_layers, message):
+                    if not self._is_cancelled:
+                        self.progress.emit(layer_idx, total_layers, message)
+
+                model_hatching = prepare_hatching_for_all_layers(
+                    layer_sections,
+                    self.hatching_params,
+                    self.hatching_strategy,
+                    progress_callback=layer_progress
+                )
+
+                # Store hatching data with (model_idx, layer_idx) keys
+                for layer_idx, hatch_lines in model_hatching.items():
+                    key = (model_idx, layer_idx)
+                    hatching_data[key] = hatch_lines
+
+            if not self._is_cancelled:
+                self.finished.emit(hatching_data)
+        except Exception as e:
+            if not self._is_cancelled:
+                self.error.emit(str(e))
+
+    def cancel(self):
+        """Request cancellation of the hatching operation."""
         self._is_cancelled = True

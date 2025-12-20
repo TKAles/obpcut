@@ -95,8 +95,24 @@ def segments_to_contours(segments: List[Tuple[float, float, float, float]]) -> L
             if loop and len(loop) >= 3:
                 contours.append(loop)
 
-    # Sort contours by area (largest first)
-    # The largest is typically the outer boundary, others are holes
+    return contours
+
+
+def group_contours_into_islands(contours: List[List[Tuple[float, float]]]) -> List[List[List[Tuple[float, float]]]]:
+    """
+    Group contours into separate islands, identifying which contours are holes.
+
+    Args:
+        contours: List of closed contours
+
+    Returns:
+        List of island groups, where each group is [outer_contour, hole1, hole2, ...]
+    """
+    if not contours:
+        return []
+
+    from shapely.geometry import Polygon, Point
+
     def contour_area(contour):
         """Calculate signed area of a contour using shoelace formula."""
         area = 0.0
@@ -104,11 +120,51 @@ def segments_to_contours(segments: List[Tuple[float, float, float, float]]) -> L
             j = (i + 1) % len(contour)
             area += contour[i][0] * contour[j][1]
             area -= contour[j][0] * contour[i][1]
-        return abs(area) / 2.0
+        return area / 2.0
 
-    contours.sort(key=contour_area, reverse=True)
+    def is_contour_inside(inner, outer):
+        """Check if inner contour is inside outer contour."""
+        try:
+            outer_poly = Polygon(outer)
+            # Check if a point from inner is inside outer
+            if len(inner) > 0:
+                point = Point(inner[0])
+                return outer_poly.contains(point)
+        except:
+            pass
+        return False
 
-    return contours
+    # Calculate area for each contour (signed area tells us orientation)
+    contours_with_area = [(c, contour_area(c)) for c in contours]
+
+    # Separate into potential outer boundaries (CCW, positive area) and holes (CW, negative area)
+    # But we need to be careful - just use absolute area for sorting
+    contours_with_area.sort(key=lambda x: abs(x[1]), reverse=True)
+
+    islands = []
+    used = set()
+
+    for i, (contour, area) in enumerate(contours_with_area):
+        if i in used:
+            continue
+
+        # This is a potential outer boundary
+        island = [contour]
+        used.add(i)
+
+        # Find all holes for this island
+        for j, (other_contour, other_area) in enumerate(contours_with_area):
+            if j in used:
+                continue
+
+            # Check if other_contour is a hole inside this island
+            if is_contour_inside(other_contour, contour):
+                island.append(other_contour)
+                used.add(j)
+
+        islands.append(island)
+
+    return islands
 
 
 def generate_hatching_for_layer(
@@ -140,15 +196,25 @@ def generate_hatching_for_layer(
     if not contours:
         return []
 
+    # Group contours into separate islands (each with their holes)
+    islands = group_contours_into_islands(contours)
+
+    if not islands:
+        return []
+
     # Get hatching plugin
     plugin = registry.get_plugin(strategy)
     if plugin is None:
         return []
 
-    # Generate hatching
-    hatch_lines = plugin.generate_hatching(contours, hatch_params, layer_index)
+    # Generate hatching for each island separately
+    all_hatch_lines = []
+    for island_contours in islands:
+        # Generate hatching for this island
+        hatch_lines = plugin.generate_hatching(island_contours, hatch_params, layer_index)
+        all_hatch_lines.extend(hatch_lines)
 
-    return hatch_lines
+    return all_hatch_lines
 
 
 def prepare_hatching_for_all_layers(

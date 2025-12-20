@@ -8,7 +8,7 @@ from PyQt6.QtCore import Qt
 # Import our custom OpenGL widget
 from opengl_widget import OpenGLWidget
 from transform_dialog import TransformDialog
-from workers import CADLoadWorker
+from workers import CADLoadWorker, SlicingWorker, HatchingWorker
 from constants import DEFAULT_LAYER_THICKNESS_STR
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -26,8 +26,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # Create hatching dialog (hidden by default)
         self.hatching_dialog = None
 
-        # Worker thread for async operations
+        # Worker threads for async operations
         self.cad_load_worker: Optional[CADLoadWorker] = None
+        self.slicing_worker: Optional[SlicingWorker] = None
+        self.hatching_worker: Optional[HatchingWorker] = None
         self.progress_dialog: Optional[QProgressDialog] = None
 
         # Add hatching menu
@@ -122,6 +124,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Connect OpenGL widget transformation changed signal
         self.openGLWidget.transformation_changed.connect(self.update_transform_dialog)
+
+        # Connect OpenGL widget async operation signals
+        self.openGLWidget.slicing_requested.connect(self.on_slicing_requested)
+        self.openGLWidget.hatching_requested.connect(self.on_hatching_requested)
     
     def open_file(self):
         """Open a file dialog to select .step or .iges files and load them asynchronously"""
@@ -205,6 +211,108 @@ class MainWindow(QtWidgets.QMainWindow):
 
         QMessageBox.critical(self, "Loading Error",
                            f"Failed to load CAD file:\n{error_message}")
+
+    def on_slicing_requested(self, models, layer_thickness):
+        """Handle slicing request from OpenGL widget"""
+        if not models:
+            return
+
+        # Create and show progress dialog
+        self.progress_dialog = QProgressDialog("Slicing models...", "Cancel", 0, 100, self)
+        self.progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        self.progress_dialog.setAutoClose(True)
+        self.progress_dialog.setAutoReset(True)
+        self.progress_dialog.canceled.connect(self.cancel_slicing)
+
+        # Create and start worker thread
+        self.slicing_worker = SlicingWorker(models, layer_thickness)
+        self.slicing_worker.progress.connect(self.on_slicing_progress)
+        self.slicing_worker.finished.connect(self.on_slicing_finished)
+        self.slicing_worker.error.connect(self.on_slicing_error)
+        self.slicing_worker.start()
+
+    def on_slicing_progress(self, current: int, total: int, message: str):
+        """Update slicing progress"""
+        if self.progress_dialog:
+            self.progress_dialog.setMaximum(total)
+            self.progress_dialog.setValue(current)
+            self.progress_dialog.setLabelText(message)
+
+    def on_slicing_finished(self, sliced_layers):
+        """Handle slicing completion"""
+        if self.progress_dialog:
+            self.progress_dialog.close()
+
+        # Update OpenGL widget with sliced layers
+        self.openGLWidget.set_sliced_layers(sliced_layers)
+
+    def on_slicing_error(self, error_message: str):
+        """Handle slicing error"""
+        if self.progress_dialog:
+            self.progress_dialog.close()
+
+        QMessageBox.critical(self, "Slicing Error",
+                           f"Failed to slice models:\n{error_message}")
+
+    def cancel_slicing(self):
+        """Cancel ongoing slicing operation"""
+        if self.slicing_worker:
+            self.slicing_worker.cancel()
+
+    def on_hatching_requested(self, sliced_layers, hatching_params, hatching_strategy):
+        """Handle hatching generation request from OpenGL widget"""
+        if not sliced_layers or not hatching_params:
+            return
+
+        # Create and show progress dialog
+        self.progress_dialog = QProgressDialog("Generating hatching...", "Cancel", 0, 100, self)
+        self.progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        self.progress_dialog.setAutoClose(True)
+        self.progress_dialog.setAutoReset(True)
+        self.progress_dialog.canceled.connect(self.cancel_hatching)
+
+        # Create and start worker thread
+        self.hatching_worker = HatchingWorker(sliced_layers, hatching_params, hatching_strategy)
+        self.hatching_worker.progress.connect(self.on_hatching_progress)
+        self.hatching_worker.finished.connect(self.on_hatching_finished)
+        self.hatching_worker.error.connect(self.on_hatching_error)
+        self.hatching_worker.start()
+
+    def on_hatching_progress(self, current: int, total: int, message: str):
+        """Update hatching progress"""
+        if self.progress_dialog:
+            self.progress_dialog.setMaximum(total)
+            self.progress_dialog.setValue(current)
+            self.progress_dialog.setLabelText(message)
+
+    def on_hatching_finished(self, hatching_data):
+        """Handle hatching generation completion"""
+        if self.progress_dialog:
+            self.progress_dialog.close()
+
+        # Update OpenGL widget with hatching data
+        self.openGLWidget.set_hatching_data(hatching_data)
+
+        # Update statistics in dialog if visible
+        stats = self.openGLWidget.get_hatching_statistics()
+        if stats and self.hatching_dialog:
+            self.hatching_dialog.update_statistics(stats)
+            # Show success message when explicitly requested from dialog
+            QMessageBox.information(self, "Hatching Generated",
+                                  f"Successfully generated hatching for {stats['total_layers']} layers.")
+
+    def on_hatching_error(self, error_message: str):
+        """Handle hatching generation error"""
+        if self.progress_dialog:
+            self.progress_dialog.close()
+
+        QMessageBox.critical(self, "Hatching Error",
+                           f"Failed to generate hatching:\n{error_message}")
+
+    def cancel_hatching(self):
+        """Cancel ongoing hatching operation"""
+        if self.hatching_worker:
+            self.hatching_worker.cancel()
 
     def remove_selected_model(self):
         """Remove the currently selected model"""
@@ -533,17 +641,11 @@ class MainWindow(QtWidgets.QMainWindow):
             params, strategy = self.hatching_dialog.get_parameters()
             self.openGLWidget.set_hatching_parameters(params, strategy)
 
-        # Enable hatching and generate
+        # Enable hatching and request async generation
         self.openGLWidget.enable_hatching(True)
-        self.openGLWidget.generate_all_hatching()
+        self.openGLWidget.request_hatching_generation()
 
-        # Update statistics in dialog
-        stats = self.openGLWidget.get_hatching_statistics()
-        if stats and self.hatching_dialog:
-            self.hatching_dialog.update_statistics(stats)
-
-        QMessageBox.information(self, "Hatching Generated",
-                              f"Successfully generated hatching for {stats['total_layers']} layers.")
+        # Note: Success message and statistics update will happen in on_hatching_finished
 
     def on_export_hatching(self):
         """Export hatching to OBP file."""

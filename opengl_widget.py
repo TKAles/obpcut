@@ -8,8 +8,16 @@ import numpy as np
 from cad_loader import load_cad_file, CADModel
 
 class OpenGLWidget(QOpenGLWidget):
+    # Build plate constants
+    BUILD_PLATE_THICKNESS = 10.0  # mm
+    BUILD_PLATE_TOP_Y = BUILD_PLATE_THICKNESS / 2  # Top surface at Y = 5mm
+
     # Signal emitted when model transformation changes via gizmo
     transformation_changed = pyqtSignal()
+    # Signals for async operations
+    slicing_requested = pyqtSignal(list, float)  # models, layer_thickness
+    hatching_requested = pyqtSignal(list, object, object)  # sliced_layers, params, strategy
+
     def __init__(self, parent=None):
         super().__init__(parent)
         # Set isometric view angles (standard isometric: 35.264° on X, 45° on Y)
@@ -69,7 +77,7 @@ class OpenGLWidget(QOpenGLWidget):
 
         # Hatching state
         self.hatching_enabled = False  # Whether to show hatching in slice mode
-        self.hatching_data = {}  # Dict mapping layer_index -> List[HatchLine]
+        self.hatching_data = {}  # Dict mapping (model_idx, layer_idx) -> List[HatchLine]
         self.hatching_params = None  # HatchingParameters instance
         self.hatching_strategy = None  # HatchingStrategy enum value
 
@@ -266,12 +274,13 @@ class OpenGLWidget(QOpenGLWidget):
         """Draw cylindrical build plate (100mm diameter, 10mm thick, stainless steel) with grid"""
         # Build plate dimensions (in same units as CAD model)
         radius = 50.0  # 100mm diameter
-        thickness = 10.0  # 10mm thick
+        thickness = self.BUILD_PLATE_THICKNESS
         segments = 64  # Number of segments for smooth cylinder
 
         glPushMatrix()
 
         # Position the build plate at the bottom
+        # Top surface will be at Y = BUILD_PLATE_TOP_Y (5mm)
         glTranslatef(0.0, -thickness/2, 0.0)
 
         # Set stainless steel material properties
@@ -730,14 +739,14 @@ class OpenGLWidget(QOpenGLWidget):
                 glTranslatef(-center_x, -center_y, -center_z)
 
         # Then translate so the model sits on top of the build plate
-        # Center it in X and Z, but place bottom at Y=0 (top of build plate)
+        # Center it in X and Z, but place bottom at Y=BUILD_PLATE_TOP_Y (top of build plate)
         if model_bounds:
             min_x, min_y, min_z, max_x, max_y, max_z = model_bounds
-            # Center in X and Z, but align bottom (min_y) to Y=0
-            glTranslatef(-model_center[0], -min_y, -model_center[2])
+            # Center in X and Z, but align bottom (min_y) to the top of build plate
+            glTranslatef(-model_center[0], self.BUILD_PLATE_TOP_Y - min_y, -model_center[2])
         else:
             # Fallback if no bounds
-            glTranslatef(-model_center[0], -model_center[1], -model_center[2])
+            glTranslatef(-model_center[0], self.BUILD_PLATE_TOP_Y - model_center[1], -model_center[2])
 
         # Enable lighting for proper shading
         glEnable(GL_LIGHTING)
@@ -1767,7 +1776,8 @@ class OpenGLWidget(QOpenGLWidget):
 
         if model_bounds:
             min_x, min_y, min_z, max_x, max_y, max_z = model_bounds
-            glTranslatef(-model_center[0], -min_y, -model_center[2])
+            # Place model on top of build plate (same as draw_cad_model)
+            glTranslatef(-model_center[0], self.BUILD_PLATE_TOP_Y - min_y, -model_center[2])
 
         # Draw triangles with unique colors
         vertices = cad_model.vertices
@@ -1875,13 +1885,8 @@ class OpenGLWidget(QOpenGLWidget):
             self.layer_thickness = layer_thickness
 
         if mode == 'slice':
-            # Generate slices for all models
-            self.slice_all_models()
-            self.current_layer_index = 0
-
-            # Generate hatching if enabled and parameters are set
-            if self.hatching_enabled and self.hatching_params:
-                self.generate_all_hatching()
+            # Request async slicing (UI will handle the worker)
+            self.slicing_requested.emit(self.models, self.layer_thickness)
         else:
             # Clear slices and hatching
             self.sliced_layers = []
@@ -1889,12 +1894,36 @@ class OpenGLWidget(QOpenGLWidget):
 
         self.update()
 
+    def set_sliced_layers(self, sliced_layers):
+        """Set the sliced layers after async slicing completes."""
+        self.sliced_layers = sliced_layers
+        self.current_layer_index = 0
+        self.update()
+
+        # Generate hatching if enabled and parameters are set
+        if self.hatching_enabled and self.hatching_params:
+            self.request_hatching_generation()
+
+    def request_hatching_generation(self):
+        """Request async hatching generation (UI will handle the worker)."""
+        if self.sliced_layers and self.hatching_params:
+            self.hatching_requested.emit(
+                self.sliced_layers,
+                self.hatching_params,
+                self.hatching_strategy
+            )
+
+    def set_hatching_data(self, hatching_data):
+        """Set the hatching data after async hatching generation completes."""
+        self.hatching_data = hatching_data
+        self.update()
+
     def update_slice_thickness(self, layer_thickness):
         """Update the layer thickness and re-slice"""
         self.layer_thickness = layer_thickness
         if self.view_mode == 'slice':
-            self.slice_all_models()
-            self.update()
+            # Request async slicing with new thickness
+            self.slicing_requested.emit(self.models, self.layer_thickness)
 
     def set_current_layer(self, layer_index):
         """Set the current layer index for slice view"""
@@ -1932,7 +1961,8 @@ class OpenGLWidget(QOpenGLWidget):
 
         # Calculate model height in world space (after transformations)
         model_height = (max_y - min_y) * scale[1]
-        model_bottom = position[1]  # Bottom of model sits at Y=0 + position offset
+        # Bottom of model sits on top of build plate + user position offset
+        model_bottom = self.BUILD_PLATE_TOP_Y + position[1]
 
         # Calculate number of layers
         num_layers = int(np.ceil(model_height / self.layer_thickness))
@@ -2455,11 +2485,10 @@ class OpenGLWidget(QOpenGLWidget):
                 self.hatching_strategy
             )
 
-            # Merge into main hatching data
+            # Store hatching data with (model_idx, layer_idx) keys to avoid collisions
             for layer_idx, hatch_lines in model_hatching.items():
-                if layer_idx not in self.hatching_data:
-                    self.hatching_data[layer_idx] = []
-                self.hatching_data[layer_idx].extend(hatch_lines)
+                key = (model_idx, layer_idx)
+                self.hatching_data[key] = hatch_lines
 
     def draw_hatching_for_layer(self, layer_index):
         """
@@ -2468,39 +2497,52 @@ class OpenGLWidget(QOpenGLWidget):
         Args:
             layer_index: Layer index to render
         """
-        if not self.hatching_enabled or layer_index not in self.hatching_data:
+        if not self.hatching_enabled:
             return
-
-        hatch_lines = self.hatching_data[layer_index]
 
         glDisable(GL_LIGHTING)
         glDisable(GL_DEPTH_TEST)
 
-        # Draw contour lines (red, thicker)
-        contour_lines = [line for line in hatch_lines if line.is_contour]
-        if contour_lines:
-            glColor3f(0.8, 0.1, 0.1)  # Red
-            glLineWidth(2.0)
-            glBegin(GL_LINES)
-            for line in contour_lines:
-                # Note: segments are (x, z) but we render in 3D (x, y, z)
-                # where y is the height dimension
-                layer_y = layer_index * self.layer_thickness
-                glVertex3f(line.start[0], layer_y, line.start[1])
-                glVertex3f(line.end[0], layer_y, line.end[1])
-            glEnd()
+        # Draw hatching for each model at this layer index
+        for model_idx in range(len(self.sliced_layers)):
+            key = (model_idx, layer_index)
+            if key not in self.hatching_data:
+                continue
 
-        # Draw infill lines (blue, thinner)
-        infill_lines = [line for line in hatch_lines if not line.is_contour]
-        if infill_lines:
-            glColor3f(0.1, 0.4, 0.8)  # Blue
-            glLineWidth(1.0)
-            glBegin(GL_LINES)
-            for line in infill_lines:
-                layer_y = layer_index * self.layer_thickness
-                glVertex3f(line.start[0], layer_y, line.start[1])
-                glVertex3f(line.end[0], layer_y, line.end[1])
-            glEnd()
+            hatch_lines = self.hatching_data[key]
+
+            # Get the actual Z height for this model's layer
+            model_sections = self.sliced_layers[model_idx]
+            section = self.find_section_for_layer(model_sections, layer_index)
+            if not section:
+                continue
+
+            # Use the middle Z height of the section
+            layer_y = (section['z_start'] + section['z_end']) / 2
+
+            # Draw contour lines (red, thicker)
+            contour_lines = [line for line in hatch_lines if line.is_contour]
+            if contour_lines:
+                glColor3f(0.8, 0.1, 0.1)  # Red
+                glLineWidth(2.0)
+                glBegin(GL_LINES)
+                for line in contour_lines:
+                    # Note: segments are (x, z) but we render in 3D (x, y, z)
+                    # where y is the height dimension
+                    glVertex3f(line.start[0], layer_y, line.start[1])
+                    glVertex3f(line.end[0], layer_y, line.end[1])
+                glEnd()
+
+            # Draw infill lines (blue, thinner)
+            infill_lines = [line for line in hatch_lines if not line.is_contour]
+            if infill_lines:
+                glColor3f(0.1, 0.4, 0.8)  # Blue
+                glLineWidth(1.0)
+                glBegin(GL_LINES)
+                for line in infill_lines:
+                    glVertex3f(line.start[0], layer_y, line.start[1])
+                    glVertex3f(line.end[0], layer_y, line.end[1])
+                glEnd()
 
         glLineWidth(1.0)
         glEnable(GL_DEPTH_TEST)
@@ -2517,7 +2559,16 @@ class OpenGLWidget(QOpenGLWidget):
             return None
 
         from hatching_integration import get_hatching_statistics
-        return get_hatching_statistics(self.hatching_data)
+
+        # Convert from {(model_idx, layer_idx): [HatchLine]} to {layer_idx: [HatchLine]}
+        # by merging all models' hatching for each layer
+        merged_data = {}
+        for (model_idx, layer_idx), hatch_lines in self.hatching_data.items():
+            if layer_idx not in merged_data:
+                merged_data[layer_idx] = []
+            merged_data[layer_idx].extend(hatch_lines)
+
+        return get_hatching_statistics(merged_data)
 
     def export_to_obp(self, filepath):
         """
@@ -2535,9 +2586,17 @@ class OpenGLWidget(QOpenGLWidget):
         try:
             from hatching_integration import convert_hatching_to_obp_format
 
+            # Convert from {(model_idx, layer_idx): [HatchLine]} to {layer_idx: [HatchLine]}
+            # by merging all models' hatching for each layer
+            merged_data = {}
+            for (model_idx, layer_idx), hatch_lines in self.hatching_data.items():
+                if layer_idx not in merged_data:
+                    merged_data[layer_idx] = []
+                merged_data[layer_idx].extend(hatch_lines)
+
             # Convert hatching data to OBP format
             obp_layers = convert_hatching_to_obp_format(
-                self.hatching_data,
+                merged_data,
                 self.layer_thickness
             )
 
