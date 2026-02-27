@@ -304,4 +304,4 @@ def load_cad_file_with_progress(
         print(error_msg)
         traceback.print_exc()
         report_progress("error", error_msg)
-        return None
+        raise

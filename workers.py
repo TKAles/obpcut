@@ -93,10 +93,8 @@ class CADLoadWorker(QThread):
 
             model = load_cad_file_with_progress(self.file_path, progress_callback)
 
-            if model is not None and not self._is_cancelled:
+            if not self._is_cancelled:
                 self.finished.emit(model)
-            elif model is None:
-                self.error.emit("Failed to load CAD file")
         except Exception as e:
             if not self._is_cancelled:
                 self.error.emit(str(e))

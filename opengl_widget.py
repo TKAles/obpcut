@@ -159,6 +159,12 @@ class OpenGLWidget(QOpenGLWidget):
 
         self.makeCurrent()
 
+        # On macOS with Metal-backed Qt6, QPainter must be created BEFORE OpenGL rendering
+        # and OpenGL must be wrapped in beginNativePainting/endNativePainting.
+        # Without this, Metal render passes can clear previously rendered OpenGL content.
+        painter = QPainter(self)
+        painter.beginNativePainting()
+
         # Ensure depth testing is enabled (might be lost during context switches)
         glEnable(GL_DEPTH_TEST)
 
@@ -230,11 +236,15 @@ class OpenGLWidget(QOpenGLWidget):
             # Draw orientation triad in bottom-left corner
             self.draw_orientation_triad()
 
-            # Draw grid labels using QPainter overlay
-            self.draw_grid_labels()
+        # End OpenGL rendering before QPainter overlay calls
+        painter.endNativePainting()
 
-        # Draw slice mode info overlay (in both modes, but only has content in slice mode)
-        self.draw_slice_info_overlay()
+        # Draw 2D text overlays using the shared QPainter (after endNativePainting)
+        if self.view_mode != 'slice':
+            self.draw_grid_labels(painter)
+        self.draw_slice_info_overlay(painter)
+
+        painter.end()
         
     def draw_cube(self):
         """Draw a simple colored cube"""
@@ -608,16 +618,16 @@ class OpenGLWidget(QOpenGLWidget):
         # Restore attributes
         glPopAttrib()
 
-    def draw_grid_labels(self):
+    def draw_grid_labels(self, painter=None):
         """Draw grid labels using QPainter overlay"""
         # Get widget dimensions
         widget_height = self.height()
         pixel_ratio = self.devicePixelRatio()
 
-        # Create painter for 2D overlay
-        painter = QPainter(self)
-        painter.beginNativePainting()
-        painter.endNativePainting()
+        # Use shared painter if provided (preferred on macOS), otherwise create one
+        own_painter = painter is None
+        if own_painter:
+            painter = QPainter(self)
 
         # Draw grid labels if any
         if self.grid_labels:
@@ -671,17 +681,18 @@ class OpenGLWidget(QOpenGLWidget):
                     text
                 )
 
-        painter.end()
+        if own_painter:
+            painter.end()
 
-    def draw_slice_info_overlay(self):
+    def draw_slice_info_overlay(self, painter=None):
         """Draw slice information text overlay in slice mode"""
         if self.view_mode != 'slice' or not hasattr(self, 'slice_info_text'):
             return
 
-        # Create painter for 2D overlay
-        painter = QPainter(self)
-        painter.beginNativePainting()
-        painter.endNativePainting()
+        # Use shared painter if provided (preferred on macOS), otherwise create one
+        own_painter = painter is None
+        if own_painter:
+            painter = QPainter(self)
 
         # Set up font - larger, bold for visibility
         font = QFont("Arial", 12, QFont.Weight.Bold)
@@ -696,7 +707,8 @@ class OpenGLWidget(QOpenGLWidget):
         x, y = self.slice_info_position
         painter.drawText(int(x), int(y), self.slice_info_text)
 
-        painter.end()
+        if own_painter:
+            painter.end()
 
     def draw_cad_model(self, model_data, is_selected=False):
         """Draw the actual CAD model using mesh data"""
