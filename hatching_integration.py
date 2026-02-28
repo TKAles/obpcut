@@ -34,8 +34,8 @@ def segments_to_contours(segments: List[Tuple[float, float, float, float]]) -> L
     tolerance = 1e-6
 
     def point_key(x, z):
-        """Create a hashable key for a point with tolerance."""
-        return (round(x / tolerance) * tolerance, round(z / tolerance) * tolerance)
+        """Create a hashable integer-tuple key for a point with tolerance."""
+        return (int(round(x / tolerance)), int(round(z / tolerance)))
 
     # Build graph: point -> list of connected points
     graph = defaultdict(list)
@@ -93,7 +93,8 @@ def segments_to_contours(segments: List[Tuple[float, float, float, float]]) -> L
                for neighbor in graph[point]):
             loop = find_loop(point)
             if loop and len(loop) >= 3:
-                contours.append(loop)
+                # Convert integer hash keys back to float mm coordinates
+                contours.append([(k[0] * tolerance, k[1] * tolerance) for k in loop])
 
     return contours
 
@@ -122,24 +123,20 @@ def group_contours_into_islands(contours: List[List[Tuple[float, float]]]) -> Li
             area -= contour[j][0] * contour[i][1]
         return area / 2.0
 
-    def is_contour_inside(inner, outer):
-        """Check if inner contour is inside outer contour."""
-        try:
-            outer_poly = Polygon(outer)
-            # Check if a point from inner is inside outer
-            if len(inner) > 0:
-                point = Point(inner[0])
-                return outer_poly.contains(point)
-        except:
-            pass
-        return False
-
     # Calculate area for each contour (signed area tells us orientation)
     contours_with_area = [(c, contour_area(c)) for c in contours]
-
-    # Separate into potential outer boundaries (CCW, positive area) and holes (CW, negative area)
-    # But we need to be careful - just use absolute area for sorting
     contours_with_area.sort(key=lambda x: abs(x[1]), reverse=True)
+
+    # Pre-create Polygon objects once to avoid O(n²) repeated construction
+    polygons = []
+    for c, _ in contours_with_area:
+        try:
+            p = Polygon(c)
+            if not p.is_valid:
+                p = p.buffer(0)
+            polygons.append(p if p.is_valid else None)
+        except Exception:
+            polygons.append(None)
 
     islands = []
     used = set()
@@ -148,19 +145,19 @@ def group_contours_into_islands(contours: List[List[Tuple[float, float]]]) -> Li
         if i in used:
             continue
 
-        # This is a potential outer boundary
         island = [contour]
         used.add(i)
+        outer_poly = polygons[i]
 
-        # Find all holes for this island
         for j, (other_contour, other_area) in enumerate(contours_with_area):
-            if j in used:
+            if j in used or outer_poly is None or polygons[j] is None:
                 continue
-
-            # Check if other_contour is a hole inside this island
-            if is_contour_inside(other_contour, contour):
-                island.append(other_contour)
-                used.add(j)
+            try:
+                if len(other_contour) > 0 and outer_poly.contains(Point(other_contour[0])):
+                    island.append(other_contour)
+                    used.add(j)
+            except Exception:
+                pass
 
         islands.append(island)
 

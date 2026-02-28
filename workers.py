@@ -156,14 +156,9 @@ class SlicingWorker(QThread):
 
     def _slice_model_standalone(self, model_data, layer_thickness):
         """
-        Standalone slicing implementation (mirrors OpenGLWidget.slice_model).
+        Standalone slicing implementation using fully vectorized numpy operations.
 
-        Args:
-            model_data: Model data dictionary with 'model', 'bounds', 'position', etc.
-            layer_thickness: Thickness of each layer in mm
-
-        Returns:
-            List of layer sections with segments
+        All vertices are pre-transformed once; per-layer work is numpy-only.
         """
         import numpy as np
 
@@ -171,206 +166,144 @@ class SlicingWorker(QThread):
         if not cad_model or not cad_model.vertices or not cad_model.indices:
             return []
 
-        # Get model bounds and transformation
         model_bounds = model_data.get('bounds')
-        position = np.asarray(model_data.get('position', [0, 0, 0]), dtype=float)
-        rotation = np.asarray(model_data.get('rotation', [0, 0, 0]), dtype=float)
-        scale = np.asarray(model_data.get('scale', [1, 1, 1]), dtype=float)
-
         if not model_bounds:
             return []
 
+        position = np.asarray(model_data.get('position', [0, 0, 0]), dtype=np.float64)
+        rotation = np.asarray(model_data.get('rotation', [0, 0, 0]), dtype=np.float64)
+        scale    = np.asarray(model_data.get('scale',    [1, 1, 1]), dtype=np.float64)
+
         min_x, min_y, min_z, max_x, max_y, max_z = model_bounds
+        model_height = (max_y - min_y) * scale[1]
+        BUILD_PLATE_TOP_Y = 5.0
+        model_bottom = BUILD_PLATE_TOP_Y + position[1]
 
-        # Calculate model height in world space
-        model_height = (max_y - min_y) * float(scale[1])
-        # Bottom of model sits on top of build plate (5mm) + user position offset
-        BUILD_PLATE_TOP_Y = 5.0  # Top of 10mm thick build plate
-        model_bottom = BUILD_PLATE_TOP_Y + float(position[1])
-
-        # Calculate number of layers
         num_layers = int(np.ceil(model_height / layer_thickness))
         if num_layers == 0:
             return []
 
-        # Slice all layers
+        # ------------------------------------------------------------------
+        # Pre-process: convert and transform ALL vertices exactly ONCE
+        # ------------------------------------------------------------------
+        verts_raw = cad_model.vertices
+        idx_raw   = cad_model.indices
+
+        verts = (verts_raw.flatten() if isinstance(verts_raw, np.ndarray)
+                 else np.array(verts_raw, dtype=np.float64).flatten()).astype(np.float64)
+        indices = (idx_raw.flatten() if isinstance(idx_raw, np.ndarray)
+                   else np.array(idx_raw, dtype=np.int32).flatten()).astype(np.int32)
+
+        # Reshape to (N_verts, 3) and apply scale
+        verts = verts.reshape(-1, 3) * scale
+
+        # Apply rotations (X → Y → Z, same order as original _transform_vertex)
+        rx, ry, rz = np.radians(rotation)
+        if rotation[0] != 0:
+            cx, sx = np.cos(rx), np.sin(rx)
+            y, z = verts[:, 1].copy(), verts[:, 2].copy()
+            verts[:, 1] = y * cx - z * sx
+            verts[:, 2] = y * sx + z * cx
+        if rotation[1] != 0:
+            cy, sy = np.cos(ry), np.sin(ry)
+            x, z = verts[:, 0].copy(), verts[:, 2].copy()
+            verts[:, 0] = x * cy + z * sy
+            verts[:, 2] = -x * sy + z * cy
+        if rotation[2] != 0:
+            cz, sz = np.cos(rz), np.sin(rz)
+            x, y = verts[:, 0].copy(), verts[:, 1].copy()
+            verts[:, 0] = x * cz - y * sz
+            verts[:, 1] = x * sz + y * cz
+
+        verts += position  # apply translation
+
+        # Build per-triangle vertex arrays: shapes (N_tris, 3)
+        tris = indices.reshape(-1, 3)
+        v0 = verts[tris[:, 0]]
+        v1 = verts[tris[:, 1]]
+        v2 = verts[tris[:, 2]]
+        y0, y1, y2 = v0[:, 1], v1[:, 1], v2[:, 1]
+
+        # Pre-compute per-triangle Y extents for fast culling
+        tri_ymin = np.minimum(np.minimum(y0, y1), y2)
+        tri_ymax = np.maximum(np.maximum(y0, y1), y2)
+
+        # ------------------------------------------------------------------
+        # Slice each layer using vectorized intersection
+        # ------------------------------------------------------------------
         all_layers = []
         for layer_idx in range(num_layers):
             if self._is_cancelled:
                 return []
 
-            layer_z = model_bottom + (layer_idx + 0.5) * layer_thickness
-            segments = self._slice_at_height(cad_model, model_data, layer_z)
+            plane_y = float(model_bottom + (layer_idx + 0.5) * layer_thickness)
+
+            # Cull triangles whose Y range doesn't span this plane
+            active = (tri_ymin <= plane_y) & (tri_ymax >= plane_y)
+            if not np.any(active):
+                segments = []
+            else:
+                segments = self._intersect_triangles_vectorized(
+                    v0[active], v1[active], v2[active],
+                    y0[active], y1[active], y2[active],
+                    plane_y
+                )
+
             all_layers.append({
-                'z_height': layer_z,
+                'z_height': plane_y,
                 'layer_index': layer_idx,
                 'segments': segments
             })
 
-            # Report progress for individual layers
             if layer_idx % 10 == 0:
                 self.progress.emit(layer_idx, num_layers, f"Slicing layer {layer_idx}/{num_layers}")
 
-        # Group layers into sections
-        sections = self._group_layers_into_sections(all_layers, model_bottom)
+        return self._group_layers_into_sections(all_layers, model_bottom)
 
-        return sections
+    def _intersect_triangles_vectorized(self, v0, v1, v2, y0, y1, y2, plane_y):
+        """
+        Vectorized plane-triangle intersection for a batch of pre-culled triangles.
 
-    def _slice_at_height(self, cad_model, model_data, slice_z):
-        """Slice the model at a specific height (standalone version)."""
+        Returns a list of (x1, z1, x2, z2) segment tuples.
+        """
         import numpy as np
 
-        try:
-            # Convert to numpy arrays and flatten to ensure 1D
-            vertices_raw = cad_model.vertices
-            indices_raw = cad_model.indices
+        def _edge_cross(va, vb, ya, yb):
+            """Return (crosses_mask, x, z) for edge va→vb."""
+            crosses = (((ya <= plane_y) & (yb >= plane_y)) |
+                       ((yb <= plane_y) & (ya >= plane_y)))
+            non_degen = np.abs(yb - ya) > 1e-10
+            crosses &= non_degen
+            safe_dy = np.where(non_degen, yb - ya, 1.0)  # avoid div/0
+            t = (plane_y - ya) / safe_dy
+            x = va[:, 0] + t * (vb[:, 0] - va[:, 0])
+            z = va[:, 2] + t * (vb[:, 2] - va[:, 2])
+            return crosses, x, z
 
-            # If already numpy arrays, get the flat data; otherwise convert
-            if isinstance(vertices_raw, np.ndarray):
-                vertices = vertices_raw.flatten().astype(float)
-            else:
-                vertices = np.array(vertices_raw, dtype=float).flatten()
+        c01, x01, z01 = _edge_cross(v0, v1, y0, y1)
+        c12, x12, z12 = _edge_cross(v1, v2, y1, y2)
+        c20, x20, z20 = _edge_cross(v2, v0, y2, y0)
 
-            if isinstance(indices_raw, np.ndarray):
-                indices = indices_raw.flatten().astype(int)
-            else:
-                indices = np.array(indices_raw, dtype=int).flatten()
+        # Priority: prefer (01,12) > (01,20) > (12,20) to get exactly one
+        # segment per triangle even in degenerate vertex-on-plane cases.
+        m01_12 = c01 & c12
+        m01_20 = c01 & c20 & ~m01_12
+        m12_20 = c12 & c20 & ~m01_12 & ~m01_20
 
-            # Convert transformation parameters to Python lists of floats
-            position = model_data.get('position', [0, 0, 0])
-            position = [float(position[0]), float(position[1]), float(position[2])]
+        parts = []
+        for mask, xa, za, xb, zb in (
+            (m01_12, x01, z01, x12, z12),
+            (m01_20, x01, z01, x20, z20),
+            (m12_20, x12, z12, x20, z20),
+        ):
+            if np.any(mask):
+                parts.append(np.stack(
+                    [xa[mask], za[mask], xb[mask], zb[mask]], axis=1))
 
-            rotation = model_data.get('rotation', [0, 0, 0])
-            rotation = [float(rotation[0]), float(rotation[1]), float(rotation[2])]
-
-            scale = model_data.get('scale', [1, 1, 1])
-            scale = [float(scale[0]), float(scale[1]), float(scale[2])]
-
-            slice_z = float(slice_z)
-        except Exception as e:
-            raise ValueError(f"Error converting data types: {e}")
-
-        segments = []
-
-        # Process each triangle
-        for i in range(0, len(indices), 3):
-            # Convert to Python int to avoid numpy indexing issues
-            # Use .item() to ensure we get Python ints, not numpy types
-            try:
-                i0 = indices[i].item() if hasattr(indices[i], 'item') else int(indices[i])
-                i1 = indices[i+1].item() if hasattr(indices[i+1], 'item') else int(indices[i+1])
-                i2 = indices[i+2].item() if hasattr(indices[i+2], 'item') else int(indices[i+2])
-            except (AttributeError, ValueError) as e:
-                continue
-
-            # Get triangle vertices - use .item() to extract numpy scalars as Python floats
-            try:
-                v0 = [vertices[i0*3].item(), vertices[i0*3+1].item(), vertices[i0*3+2].item()]
-                v1 = [vertices[i1*3].item(), vertices[i1*3+1].item(), vertices[i1*3+2].item()]
-                v2 = [vertices[i2*3].item(), vertices[i2*3+1].item(), vertices[i2*3+2].item()]
-            except (AttributeError, IndexError) as e:
-                # Skip this triangle if we can't extract vertices
-                continue
-
-            # Apply transformations
-            v0_t = self._transform_vertex(v0, position, rotation, scale)
-            v1_t = self._transform_vertex(v1, position, rotation, scale)
-            v2_t = self._transform_vertex(v2, position, rotation, scale)
-
-            # Intersect with horizontal plane
-            line_segment = self._intersect_triangle_plane(v0_t, v1_t, v2_t, slice_z)
-            if line_segment:
-                segments.append(line_segment)
-
-        return segments
-
-    def _transform_vertex(self, vertex, position, rotation, scale):
-        """Apply transformation to a vertex.
-
-        Args:
-            vertex: List of 3 floats [x, y, z]
-            position: List of 3 floats [x, y, z]
-            rotation: List of 3 floats [rx, ry, rz] in degrees
-            scale: List of 3 floats [sx, sy, sz]
-
-        Returns:
-            List of 3 floats representing transformed vertex
-        """
-        import math
-
-        # All inputs are already Python lists of floats
-        # Apply scale
-        v = [vertex[0] * scale[0], vertex[1] * scale[1], vertex[2] * scale[2]]
-
-        # Apply rotation (X, Y, Z order)
-        if rotation[0] != 0:  # X rotation
-            angle = math.radians(rotation[0])
-            cos_a, sin_a = math.cos(angle), math.sin(angle)
-            y, z = v[1], v[2]
-            v[1] = y * cos_a - z * sin_a
-            v[2] = y * sin_a + z * cos_a
-
-        if rotation[1] != 0:  # Y rotation
-            angle = math.radians(rotation[1])
-            cos_a, sin_a = math.cos(angle), math.sin(angle)
-            x, z = v[0], v[2]
-            v[0] = x * cos_a + z * sin_a
-            v[2] = -x * sin_a + z * cos_a
-
-        if rotation[2] != 0:  # Z rotation
-            angle = math.radians(rotation[2])
-            cos_a, sin_a = math.cos(angle), math.sin(angle)
-            x, y = v[0], v[1]
-            v[0] = x * cos_a - y * sin_a
-            v[1] = x * sin_a + y * cos_a
-
-        # Apply translation
-        v[0] += position[0]
-        v[1] += position[1]
-        v[2] += position[2]
-
-        return v
-
-    def _intersect_triangle_plane(self, v0, v1, v2, plane_y):
-        """Find intersection of triangle with horizontal plane."""
-        # Get Y coordinates and convert to float to avoid numpy array comparison issues
-        y0, y1, y2 = float(v0[1]), float(v1[1]), float(v2[1])
-        plane_y = float(plane_y)
-
-        # Find which edges cross the plane
-        edges_cross = []
-
-        # Check edge v0-v1
-        if (y0 <= plane_y <= y1) or (y1 <= plane_y <= y0):
-            if abs(y1 - y0) > 1e-10:
-                t = (plane_y - y0) / (y1 - y0)
-                x = float(v0[0]) + t * (float(v1[0]) - float(v0[0]))
-                z = float(v0[2]) + t * (float(v1[2]) - float(v0[2]))
-                edges_cross.append((x, z))
-
-        # Check edge v1-v2
-        if (y1 <= plane_y <= y2) or (y2 <= plane_y <= y1):
-            if abs(y2 - y1) > 1e-10:
-                t = (plane_y - y1) / (y2 - y1)
-                x = float(v1[0]) + t * (float(v2[0]) - float(v1[0]))
-                z = float(v1[2]) + t * (float(v2[2]) - float(v1[2]))
-                edges_cross.append((x, z))
-
-        # Check edge v2-v0
-        if (y2 <= plane_y <= y0) or (y0 <= plane_y <= y2):
-            if abs(y0 - y2) > 1e-10:
-                t = (plane_y - y2) / (y0 - y2)
-                x = float(v2[0]) + t * (float(v0[0]) - float(v2[0]))
-                z = float(v2[2]) + t * (float(v0[2]) - float(v2[2]))
-                edges_cross.append((x, z))
-
-        # Need exactly 2 intersection points
-        if len(edges_cross) == 2:
-            p0, p1 = edges_cross[0], edges_cross[1]
-            # Return as (x1, z1, x2, z2)
-            return (float(p0[0]), float(p0[1]), float(p1[0]), float(p1[1]))
-
-        return None
+        if not parts:
+            return []
+        segs = np.vstack(parts)
+        return [tuple(row) for row in segs]
 
     def _group_layers_into_sections(self, all_layers, model_bottom):
         """Group consecutive layers with identical outlines into sections."""
