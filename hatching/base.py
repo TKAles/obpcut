@@ -166,8 +166,8 @@ class HatchingPlugin(ABC):
         """
         Optimize the scanning path to minimize travel time.
 
-        This is a simple greedy nearest-neighbor optimization.
-        Subclasses can override for more sophisticated optimization.
+        Greedy nearest-neighbor using vectorized numpy distance comparisons
+        so each iteration is O(n) in numpy rather than O(n) pure Python.
 
         Args:
             hatch_lines: Unoptimized hatch lines
@@ -178,35 +178,33 @@ class HatchingPlugin(ABC):
         if not hatch_lines:
             return []
 
+        n = len(hatch_lines)
+        starts = np.array([l.start for l in hatch_lines], dtype=np.float64)
+        ends   = np.array([l.end   for l in hatch_lines], dtype=np.float64)
+
         optimized = []
-        remaining = hatch_lines.copy()
-        current_pos = remaining[0].start
+        visited = np.zeros(n, dtype=bool)
+        current_pos = starts[0].copy()
 
-        while remaining:
-            # Find nearest line (by start or end point)
-            min_dist = float('inf')
-            best_idx = 0
-            flip = False
+        for _ in range(n):
+            # Squared distances to every unvisited line's start and end
+            ds = np.sum((starts - current_pos) ** 2, axis=1)
+            de = np.sum((ends   - current_pos) ** 2, axis=1)
+            ds[visited] = np.inf
+            de[visited] = np.inf
 
-            for i, line in enumerate(remaining):
-                # Distance to start
-                dist_start = self._point_distance(current_pos, line.start)
-                if dist_start < min_dist:
-                    min_dist = dist_start
-                    best_idx = i
-                    flip = False
+            best_start_idx = int(np.argmin(ds))
+            best_end_idx   = int(np.argmin(de))
 
-                # Distance to end
-                dist_end = self._point_distance(current_pos, line.end)
-                if dist_end < min_dist:
-                    min_dist = dist_end
-                    best_idx = i
-                    flip = True
+            if ds[best_start_idx] <= de[best_end_idx]:
+                best_idx, flip = best_start_idx, False
+            else:
+                best_idx, flip = best_end_idx, True
 
-            # Add the best line
-            line = remaining.pop(best_idx)
+            visited[best_idx] = True
+            line = hatch_lines[best_idx]
+
             if flip:
-                # Reverse the line
                 line = HatchLine(
                     start=line.end,
                     end=line.start,
@@ -217,7 +215,7 @@ class HatchingPlugin(ABC):
                 )
 
             optimized.append(line)
-            current_pos = line.end
+            current_pos = np.array(line.end)
 
         return optimized
 

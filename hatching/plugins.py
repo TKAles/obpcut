@@ -120,6 +120,7 @@ class LineHatchingPlugin(HatchingPlugin):
             List of HatchLine objects
         """
         from shapely.affinity import rotate as shapely_rotate
+        from shapely.geometry import MultiLineString
 
         # Get bounding box
         bounds = polygon.bounds  # (minx, miny, maxx, maxy)
@@ -130,50 +131,71 @@ class LineHatchingPlugin(HatchingPlugin):
         center_y = (miny + maxy) / 2
 
         # Rotate polygon to align with scanning direction (makes line generation easier)
-        # We rotate backwards, so we can generate horizontal lines
         rotated_polygon = shapely_rotate(polygon, -angle, origin=(center_x, center_y))
 
         # Get new bounding box
         rot_bounds = rotated_polygon.bounds
         rot_minx, rot_miny, rot_maxx, rot_maxy = rot_bounds
 
-        # Generate horizontal lines in rotated space
+        # Build all scan lines at once using np.arange, then do a single intersection call
+        ys = np.arange(rot_miny + spacing / 2, rot_maxy + 1e-10, spacing)
+        if len(ys) == 0:
+            return []
+
+        scan_lines = [((rot_minx - 1, y), (rot_maxx + 1, y)) for y in ys]
+        multi_line = MultiLineString(scan_lines)
+
+        # Single intersection call instead of one per scan line
+        intersection = multi_line.intersection(rotated_polygon)
+        if intersection.is_empty:
+            return []
+
+        # Extract segments from result
         segments = []
-        y = rot_miny + spacing / 2  # Start with offset
+        geoms = intersection.geoms if hasattr(intersection, 'geoms') else [intersection]
+        for geom in geoms:
+            if geom.geom_type == 'LineString':
+                coords = list(geom.coords)
+                if len(coords) >= 2:
+                    segments.append((coords[0], coords[-1]))
 
-        while y <= rot_maxy:
-            # Create a horizontal line across the bounding box
-            line_start = (rot_minx - 1, y)  # Extend slightly beyond bounds
-            line_end = (rot_maxx + 1, y)
-
-            # Clip line to polygon
-            clipped_segments = clip_line_to_polygon(line_start, line_end, rotated_polygon)
-            segments.extend(clipped_segments)
-
-            y += spacing
+        if not segments:
+            return []
 
         # Sort segments for efficient scanning
         if parameters.bidirectional:
             segments = sort_segments_for_scanning(segments, bidirectional=True)
 
-        # Rotate segments back to original orientation
-        hatch_lines = []
-        for start, end in segments:
-            # Rotate points back
-            from .utils import rotate_point
-            rotated_start = rotate_point(start, (center_x, center_y), angle)
-            rotated_end = rotate_point(end, (center_x, center_y), angle)
+        # Vectorized rotation of all endpoints back to original orientation
+        angle_rad = np.radians(angle)
+        cos_a = np.cos(angle_rad)
+        sin_a = np.sin(angle_rad)
 
-            hatch_lines.append(HatchLine(
-                start=rotated_start,
-                end=rotated_end,
+        pts_start = np.array([s[0] for s in segments])
+        pts_end = np.array([s[1] for s in segments])
+
+        def _rotate_batch(pts):
+            dx = pts[:, 0] - center_x
+            dy = pts[:, 1] - center_y
+            return np.column_stack([
+                dx * cos_a - dy * sin_a + center_x,
+                dx * sin_a + dy * cos_a + center_y,
+            ])
+
+        r_starts = _rotate_batch(pts_start)
+        r_ends = _rotate_batch(pts_end)
+
+        return [
+            HatchLine(
+                start=(float(r_starts[i, 0]), float(r_starts[i, 1])),
+                end=(float(r_ends[i, 0]), float(r_ends[i, 1])),
                 speed=parameters.scan_speed,
                 power=parameters.power_level,
                 layer_index=layer_index,
                 is_contour=False
-            ))
-
-        return hatch_lines
+            )
+            for i in range(len(segments))
+        ]
 
 
 # Additional plugins can be added here following the same pattern

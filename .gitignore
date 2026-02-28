@@ -1,5 +1,8 @@
 # Ignore the virtual env
 .obpenv/
+# ignore claude
+.claude/
+claude.MD
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
